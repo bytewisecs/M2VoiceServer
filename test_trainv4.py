@@ -167,13 +167,37 @@ class TrainV4Tests(unittest.TestCase):
     def test_vocal_orientation_and_complex_values(self):
         dataset = self.dataset()
         path = dataset.samples[0]["vocal_path"]
-        original = np.arange(16 * 256, dtype=np.float32).reshape(16, 256)
-        np.save(path, original + 1j * original)
+        # 已知四象限相位：绝对值实现会丢失这些差异。
+        original = np.tile(np.array([1+1j, -1+1j, -1-1j, 1-1j], dtype=np.complex64),
+                           16 * 64).reshape(16, 256)
+        phases = torch.tensor([np.pi/4, 3*np.pi/4, -3*np.pi/4, -np.pi/4],
+                              dtype=torch.float32).repeat(16 * 64).reshape(16, 256)
+        expected = (phases - phases.mean()) / (phases.std() + 1e-6)
+        np.save(path, original)
         first = dataset[0]["vocal"]
-        np.save(path, (original + 1j * original).T)
+        np.save(path, original.T)
         second = dataset[0]["vocal"]
         self.assertEqual(tuple(first.shape), (16, 256))
+        torch.testing.assert_close(first, expected)
         torch.testing.assert_close(first, second)
+        # 独立改变幅度，不应改变相位输入。
+        amplitudes = np.linspace(0.1, 10, original.size, dtype=np.float32).reshape(original.shape)
+        np.save(path, original * amplitudes)
+        torch.testing.assert_close(dataset[0]["vocal"], expected)
+        # 已提取的实数相位不能再次取 angle（否则会退化成 0/pi）。
+        np.save(path, phases.numpy())
+        torch.testing.assert_close(dataset[0]["vocal"], expected)
+
+    def test_nonfinite_complex_vocal_is_rejected_before_phase_conversion(self):
+        dataset = self.dataset()
+        path = dataset.samples[0]["vocal_path"]
+        for value in (complex(np.inf, 1), complex(1, np.inf), complex(np.nan, 1)):
+            with self.subTest(value=value):
+                original = np.ones((16, 256), dtype=np.complex64)
+                original[0, 0] = value
+                np.save(path, original)
+                with self.assertRaisesRegex(ValueError, "Vocal 原始复数特征"):
+                    dataset[0]
 
     def test_model_forward_and_backward_with_variable_lengths(self):
         dataset = self.dataset()
@@ -208,6 +232,8 @@ class TrainV4Tests(unittest.TestCase):
             training.train(args)
         checkpoint = torch.load(self.output / "checkpoints/best_model.pth", map_location="cpu")
         self.assertEqual(checkpoint["model_version"], training.MODEL_VERSION)
+        self.assertEqual(checkpoint["run_metadata"]["vocal_representation"],
+                         "complex_angle_radians_or_existing_real_phase")
         self.assertEqual(checkpoint["config"]["pool_bins"], 2)
         history = json.loads((self.output / "training_history.json").read_text(encoding="utf-8"))
         self.assertEqual(len(history), 1)

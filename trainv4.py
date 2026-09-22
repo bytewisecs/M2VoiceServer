@@ -23,7 +23,7 @@ from mDataloader.exclusions import INVALID_GROUPS
 
 
 VOCAL_CHANNELS = 256
-MODEL_VERSION = "compact_tcn_late_fusion_v1"
+MODEL_VERSION = "compact_tcn_late_fusion_phase_v2"
 AUDIO_NAME_PATTERN = re.compile(r"^audio_(\d{8}_\d{6})_(s(?:10|[1-9]))$", re.IGNORECASE)
 
 
@@ -319,7 +319,15 @@ class M2VoiceTextDataset(Dataset):
         lip = np.asarray(lip, dtype=np.float32).squeeze()
 
         if np.iscomplexobj(vocal):
-            vocal = np.abs(vocal)
+            # 先检查原始复数；angle(inf + 1j) 等情况可能得到有限值，掩盖坏数据。
+            invalid_count = int(np.count_nonzero(~np.isfinite(vocal)))
+            if invalid_count:
+                raise ValueError(
+                    f"Vocal 原始复数特征含 {invalid_count} 个 NaN 或 Inf："
+                    f"{sample['id']}，文件：{sample['vocal_path']}"
+                )
+            # 复数输入取主值相位（弧度，[-pi, pi]）；实数输入按已有相位处理。
+            vocal = np.angle(vocal)
 
         vocal = np.asarray(vocal, dtype=np.float32).squeeze()
 
@@ -624,7 +632,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="runs/trainv4_dt4_tcn",
+        default="runs/trainv4_dt4_tcn_phase",
         help="checkpoint、结果和TensorBoard日志的输出目录。"
     )
     parser.add_argument("--epochs", type=int, default=100)
@@ -760,6 +768,7 @@ def train(args):
 
     run_metadata = {
         "model_version": MODEL_VERSION,
+        "vocal_representation": "complex_angle_radians_or_existing_real_phase",
         "args": vars(args),
         "label_texts": label_texts,
         "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
@@ -838,6 +847,7 @@ def train(args):
         num_classes=len(label_texts),
     ).to(device)
     print(f"Model: {MODEL_VERSION}, modality={args.modality}")
+    print("Vocal input: complex -> phase radians [-pi, pi]; real -> existing phase; per-sample standardization")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -1063,7 +1073,7 @@ def train(args):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if checkpoint.get("model_version") != MODEL_VERSION:
-        raise ValueError("Checkpoint 模型版本不匹配；新 TCN 模型需要重新训练。")
+        raise ValueError("Checkpoint 模型/输入版本不匹配；相位输入模型需要重新训练。")
     if checkpoint["label_texts"] != label_texts:
         raise ValueError("Checkpoint标签映射与当前GT标签映射不一致。")
 
