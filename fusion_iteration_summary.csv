@@ -1,7 +1,0 @@
-﻿experiment_name,modality,vocal_representation,norm_type,pooling,modality_dropout,num_layers,mlp_dim,dropout,weight_decay,best_epoch,best_val_loss,best_val_accuracy,train_accuracy,val_accuracy,test_accuracy
-fusion_baseline,fusion,magnitude,batch,mean,0.0,3,256,0.2,0.001,45,1.5615286350250244,0.55,0.9575757575757575,0.55,0.55
-fusion_groupnorm,fusion,magnitude,group,mean,0.0,3,256,0.2,0.001,47,1.3996124505996703,0.5,0.8757575757575757,0.5,0.5
-fusion_attention_pool,fusion,magnitude,batch,attention,0.0,3,256,0.2,0.001,47,1.5922163486480714,0.525,0.9606060606060606,0.525,0.575
-fusion_modality_dropout,fusion,magnitude,batch,mean,0.3,3,256,0.2,0.001,73,1.5754552364349366,0.475,0.9696969696969697,0.475,0.425
-fusion_regularized,fusion,magnitude,batch,mean,0.0,2,128,0.4,0.01,39,1.8395483493804932,0.45,0.6303030303030303,0.45,0.425
-fusion_combined,fusion,magnitude,group,attention,0.3,2,128,0.4,0.01,26,2.048488998413086,0.4,0.34545454545454546,0.4,0.325

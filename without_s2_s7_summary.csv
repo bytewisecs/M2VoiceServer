@@ -1,2 +1,0 @@
-﻿modality,best_epoch,best_val_loss,best_val_accuracy,train_accuracy,val_accuracy,test_accuracy
-fusion,35,1.4729973077774048,0.5625,0.9090909090909091,0.5625,0.5
