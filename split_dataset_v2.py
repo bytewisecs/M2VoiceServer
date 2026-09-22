@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from remove_abnormal_samples import SAMPLE_IDS as EXCLUDED_SAMPLE_IDS
+from mDataloader.exclusions import INVALID_GROUPS
 
 
 # ============================================================
@@ -111,6 +112,9 @@ def collect_samples(label_texts):
             continue
 
         group_id = match.group("group_id")
+        if group_id in INVALID_GROUPS:
+            print(f"[Skip known invalid group] {audio_file.name}")
+            continue
         suffix = match.group("suffix").lower()
         suffix_number = int(suffix[1:])
         paths = build_sample_paths(audio_file, group_id, suffix)
@@ -166,6 +170,8 @@ def collect_samples(label_texts):
             f"数据完整性检查失败，共发现{len(errors)}个错误：\n{preview}"
         )
 
+    if not samples:
+        raise ValueError("排除已知无效会话后，没有可用于划分的样本。")
     return samples
 
 
@@ -393,6 +399,7 @@ def verify_and_summarize(manifest_rows, label_texts, split_to_group_ids):
         "output_dir": str(OUT_DIR),
         "ratio_unit": "acquisition_group",
         "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
+        "excluded_group_ids": sorted(INVALID_GROUPS),
         "sample_count": len(manifest_rows),
         "group_count": sum(len(ids) for ids in split_to_group_ids.values()),
         "splits": {},

@@ -107,6 +107,14 @@ class SplitDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "待排除样本仍存在"):
             splitter.collect_samples(self.labels)
 
+    def test_known_invalid_group_is_excluded_without_deleting_source(self):
+        self.write_source(self.samples[:1])
+        invalid = self.root / "Audio/audio_20260411_171730_s1.wav"
+        invalid.touch()
+        samples = splitter.collect_samples(self.labels)
+        self.assertEqual([sample["sample_id"] for sample in samples], [self.samples[0]["sample_id"]])
+        self.assertTrue(invalid.exists())
+
     def test_missing_modality_is_not_silently_skipped(self):
         self.write_source(self.samples[:1])
         self.samples[0]["paths"]["mmVocal"].unlink()

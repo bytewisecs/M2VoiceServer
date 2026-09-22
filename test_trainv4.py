@@ -71,6 +71,55 @@ class TrainV4Tests(unittest.TestCase):
         model.assert_not_called()
         self.assertFalse(self.output.exists())
 
+    def test_existing_manifest_is_checked_before_excluding_known_bad_group(self):
+        extra_rows = []
+        for label_id in range(10):
+            group = "20260411_171730"
+            suffix = f"s{label_id + 1}"
+            sample_id = f"audio_{group}_{suffix}"
+            root = self.split_root / "train"
+            (root / "Audio" / f"{sample_id}.wav").touch()
+            (root / "txt" / f"{sample_id}.txt").write_text(self.labels[label_id], encoding="utf-8")
+            np.save(root / "mmLip" / f"mmW_{group}_Lip_{suffix}.npy", np.full(16, np.nan))
+            np.save(root / "mmVocal" / f"mmW_{group}_Vib_{suffix}.npy", np.ones((16, 256)))
+            extra_rows.append({
+                "split": "train", "group_id": group, "sample_id": sample_id,
+                "suffix": suffix, "command_set": 1, "label_id": label_id,
+                "gt_number": label_id + 1, "label_text": self.labels[label_id],
+            })
+        self.write_manifest(self.rows + extra_rows)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            training.train(self.args("--check-data-only"))
+        self.assertIn("passed (70 samples)", output.getvalue())
+        self.assertIn("excluded=10, remaining=20", output.getvalue())
+        self.assertFalse(self.output.exists())
+        self.assertTrue((root / "Audio/audio_20260411_171730_s1.wav").exists())
+        extra_rows[0]["label_id"] = 1
+        self.write_manifest(self.rows + extra_rows)
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "清单标签映射"):
+            training.train(self.args("--check-data-only"))
+
+    def test_exclusion_cannot_remove_a_whole_class_silently(self):
+        dataset = self.dataset()
+        for sample in dataset.samples:
+            if sample["label"] == 0:
+                sample["group_id"] = "20260411_171730"
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "缺少类别"):
+            training.exclude_known_invalid_groups((dataset,))
+
+    def test_feature_check_reports_all_unknown_invalid_samples(self):
+        dataset = self.dataset()
+        first, second = dataset.samples[:2]
+        np.save(first["lip_path"], np.full(16, np.nan))
+        np.save(second["vocal_path"], np.full((16, 256), np.inf))
+        with redirect_stdout(io.StringIO()), self.assertRaises(ValueError) as caught:
+            training.check_features((dataset,))
+        message = str(caught.exception)
+        for expected in ("共 2 个样本", first["id"], second["id"], "Lip", "Vocal"):
+            self.assertIn(expected, message)
+        self.assertEqual(len(dataset), 20)
+
     def test_missing_modality_is_rejected(self):
         next((self.split_root / "train/mmLip").glob("*.npy")).unlink()
         with self.assertRaisesRegex(ValueError, "缺少文件"):

@@ -18,6 +18,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tensorboardX import SummaryWriter
 
 from remove_abnormal_samples import SAMPLE_IDS as EXCLUDED_SAMPLE_IDS
+from mDataloader.exclusions import INVALID_GROUPS
 
 
 VOCAL_CHANNELS = 256
@@ -343,8 +344,15 @@ class M2VoiceTextDataset(Dataset):
 
         if lip.size < 2 or vocal.shape[0] < 2:
             raise ValueError(f"特征时间序列至少需要 2 帧：{sample['id']}")
-        if not np.isfinite(lip).all() or not np.isfinite(vocal).all():
-            raise ValueError(f"特征含 NaN 或 Inf：{sample['id']}")
+        for name, values, path in (
+            ("Lip", lip, sample["lip_path"]),
+            ("Vocal", vocal, sample["vocal_path"]),
+        ):
+            invalid_count = int(np.count_nonzero(~np.isfinite(values)))
+            if invalid_count:
+                raise ValueError(
+                    f"{name} 特征含 {invalid_count} 个 NaN 或 Inf：{sample['id']}，文件：{path}"
+                )
 
         lip = torch.from_numpy(lip).float()
         vocal = torch.from_numpy(vocal).float()
@@ -528,11 +536,37 @@ def validate_split_manifest(split_root, datasets):
     print(f"Split manifest check: passed ({len(seen)} samples)")
 
 
-def check_features(datasets):
+def exclude_known_invalid_groups(datasets):
+    """在完整清单核对之后应用已有会话排除规则，兼容旧划分目录。"""
+    excluded = {}
     for dataset in datasets:
+        removed = [sample for sample in dataset.samples if sample["group_id"] in INVALID_GROUPS]
+        excluded[dataset.split_name] = [sample["id"] for sample in removed]
+        if not removed:
+            continue
+        dataset.samples = [sample for sample in dataset.samples if sample["group_id"] not in INVALID_GROUPS]
+        print(f"[Known invalid groups] {dataset.split_name}: excluded={len(removed)}, remaining={len(dataset)}")
+        for sample in removed:
+            print(f"  Excluded: {sample['id']}")
+        if not dataset.samples:
+            raise ValueError(f"{dataset.split_name} 排除已知无效会话后为空。")
+        dataset.print_class_distribution()
+    return excluded
+
+
+def check_features(datasets):
+    errors = []
+    for dataset in datasets:
+        passed = 0
         for index in range(len(dataset)):
-            dataset[index]
-        print(f"Feature check: {dataset.split_name}, {len(dataset)} samples passed")
+            try:
+                dataset[index]
+                passed += 1
+            except (OSError, ValueError) as exc:
+                errors.append(f"[{dataset.split_name}] {dataset.samples[index]['id']}: {exc}")
+        print(f"Feature check: {dataset.split_name}, {passed}/{len(dataset)} samples passed")
+    if errors:
+        raise ValueError(f"特征检查失败，共 {len(errors)} 个样本；未启动训练：\n" + "\n".join(errors))
 
 
 def parse_args():
@@ -657,6 +691,7 @@ def train(args):
 
     datasets = (train_dataset, val_dataset, test_dataset)
     validate_split_manifest(split_root, datasets)
+    excluded_by_split = exclude_known_invalid_groups(datasets)
     check_features(datasets)
     if args.check_data_only:
         print("\n数据检查通过，未启动训练。")
@@ -670,6 +705,8 @@ def train(args):
         "args": vars(args),
         "label_texts": label_texts,
         "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
+        "excluded_group_ids": sorted(INVALID_GROUPS),
+        "excluded_group_samples_by_split": excluded_by_split,
         "splits": {
             dataset.split_name: {
                 "samples": len(dataset),

@@ -8,9 +8,11 @@ import pdb
 
 from torch.nn.utils.rnn import pad_sequence
 
-INVALID_GROUPS = {
-    "20260411_171730",
-}
+if __package__:
+    from .exclusions import INVALID_GROUPS
+else:
+    # 兼容直接执行 python mDataloader/mDataset.py。
+    from exclusions import INVALID_GROUPS
 
 def multi_modal_collate_fn(batch):
     """
