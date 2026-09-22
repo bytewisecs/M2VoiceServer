@@ -1,0 +1,149 @@
+{
+  "best_epoch": 1,
+  "best_val_loss": NaN,
+  "best_val_accuracy": 0.05,
+  "test_loss": NaN,
+  "test_accuracy": 0.05,
+  "per_class_test_results": [
+    {
+      "label_id": 0,
+      "text": "turn on the living room lights ",
+      "correct": 4,
+      "total": 4,
+      "accuracy": 1.0
+    },
+    {
+      "label_id": 1,
+      "text": "dim the bedroom lights by thirty percent ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 2,
+      "text": "are all the windows closed ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 3,
+      "text": "set an alarm for seven thirty am tomorrow ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 4,
+      "text": "remind me to buy groceries at five pm ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 5,
+      "text": "call david on speakerphone ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 6,
+      "text": "what's on my calendar for next tuesday ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 7,
+      "text": "play some jazz music on spotify ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 8,
+      "text": "skip to the next track ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 9,
+      "text": "pause the video and increase the volume ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 10,
+      "text": "rewind thirty seconds ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 11,
+      "text": "navigate to the nearest gas station ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 12,
+      "text": "how is the traffic on my way to work ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 13,
+      "text": "cancel the current route ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 14,
+      "text": "how long will it take to get to the airport ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 15,
+      "text": "convert fifty us dollars to euros ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 16,
+      "text": "who won the super bowl last year ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 17,
+      "text": "stop listening ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 18,
+      "text": "wake up ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    },
+    {
+      "label_id": 19,
+      "text": "turn on airplane mode ",
+      "correct": 0,
+      "total": 4,
+      "accuracy": 0.0
+    }
+  ]
+}

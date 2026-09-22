@@ -1,0 +1,6 @@
+﻿experiment_name,modality,vocal_representation,best_epoch,best_val_loss,best_val_accuracy,train_accuracy,val_accuracy,test_accuracy
+vocal_magnitude,vocal,magnitude,27,2.1300086975097656,0.175,0.19090909090909092,0.175,0.175
+vocal_phase,vocal,phase,18,2.5645719528198243,0.125,0.5454545454545454,0.125,0.125
+vocal_phase_diff,vocal,phase_diff,19,2.250004768371582,0.175,0.5363636363636364,0.175,0.125
+vocal_real_imag,vocal,real_imag,8,2.3699509143829345,0.15,0.23030303030303031,0.15,0.15
+vocal_magnitude_phase,vocal,magnitude_phase,15,2.420844841003418,0.15,0.48787878787878786,0.15,0.15

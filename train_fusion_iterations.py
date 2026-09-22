@@ -1,0 +1,1252 @@
+import os
+import re
+import math
+import json
+import csv
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+import ml_collections
+
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+
+def clean_text(text):
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z' ]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def get_config(experiment):
+    config = ml_collections.ConfigDict()
+    config.hidden_size = 64
+    config.num_heads = 4
+    config.mlp_dim = experiment.get("mlp_dim", 256)
+    config.num_layers = experiment.get("num_layers", 3)
+    config.dropout = experiment.get("dropout", 0.2)
+    config.weight_decay = experiment.get("weight_decay", 1e-3)
+    config.norm_type = experiment.get("norm_type", "batch")
+    config.pooling = experiment.get("pooling", "mean")
+    config.modality_dropout = experiment.get("modality_dropout", 0.0)
+    return config
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).float().unsqueeze(1)
+
+        div = torch.exp(
+            torch.arange(0, d_model, 2).float()
+            * (-math.log(10000.0) / d_model)
+        )
+
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+
+class ConvFrontend1D(nn.Module):
+    def __init__(self, in_channels, hidden_size, norm_type="batch"):
+        super().__init__()
+
+        def make_norm(channels):
+            if norm_type == "batch":
+                return nn.BatchNorm1d(channels)
+            if norm_type == "group":
+                groups = 8 if channels % 8 == 0 else 4
+                return nn.GroupNorm(groups, channels)
+            raise ValueError(f"Unsupported norm type: {norm_type}")
+
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_size // 2, kernel_size=7, stride=2, padding=3),
+            make_norm(hidden_size // 2),
+            nn.GELU(),
+
+            nn.Conv1d(hidden_size // 2, hidden_size, kernel_size=5, stride=2, padding=2),
+            make_norm(hidden_size),
+            nn.GELU(),
+
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, stride=1, padding=1),
+            make_norm(hidden_size),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LipVocalTextClassifier(nn.Module):
+    def __init__(
+        self,
+        config,
+        num_classes,
+        target_seq_len=128,
+        modality="fusion",
+        vocal_in_channels=256
+    ):
+        super().__init__()
+
+        if modality not in {"lip", "vocal", "fusion"}:
+            raise ValueError(f"Unsupported modality: {modality}")
+
+        hidden = config.hidden_size
+        self.target_seq_len = target_seq_len
+        self.modality = modality
+        self.pooling = config.pooling
+        self.modality_dropout = config.modality_dropout
+
+        self.lip_frontend = ConvFrontend1D(
+            in_channels=1,
+            hidden_size=hidden,
+            norm_type=config.norm_type
+        )
+
+        self.vocal_frontend = ConvFrontend1D(
+            in_channels=vocal_in_channels,
+            hidden_size=hidden,
+            norm_type=config.norm_type
+        )
+
+        fusion_input_dim = hidden * 2 if modality == "fusion" else hidden
+
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_input_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+        )
+
+        self.pos_encoder = PositionalEncoding(hidden, max_len=target_seq_len)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=config.num_heads,
+            dim_feedforward=config.mlp_dim,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config.num_layers
+        )
+
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden, num_classes)
+        )
+
+        if self.pooling == "attention":
+            self.attention_pool = nn.Sequential(
+                nn.Linear(hidden, hidden),
+                nn.Tanh(),
+                nn.Linear(hidden, 1),
+            )
+        elif self.pooling != "mean":
+            raise ValueError(f"Unsupported pooling: {self.pooling}")
+
+    def forward(self, lip, vocal):
+        features = []
+
+        if self.modality in {"lip", "fusion"}:
+            lip_feat = self.lip_frontend(lip)
+            lip_feat = F.interpolate(
+                lip_feat,
+                size=self.target_seq_len,
+                mode="linear",
+                align_corners=False
+            )
+            features.append(lip_feat.transpose(1, 2))
+
+        if self.modality in {"vocal", "fusion"}:
+            vocal_feat = self.vocal_frontend(vocal)
+            vocal_feat = F.interpolate(
+                vocal_feat,
+                size=self.target_seq_len,
+                mode="linear",
+                align_corners=False
+            )
+            features.append(vocal_feat.transpose(1, 2))
+
+        if self.modality == "fusion":
+            if self.training and self.modality_dropout > 0:
+                lip_feat, vocal_feat = features
+                random_values = torch.rand(
+                    lip_feat.size(0), 1, 1,
+                    device=lip_feat.device
+                )
+                half_probability = self.modality_dropout / 2.0
+
+                # 每个样本最多丢弃一种模态，不会同时清零两种模态。
+                drop_lip = random_values < half_probability
+                drop_vocal = (
+                    (random_values >= half_probability)
+                    & (random_values < self.modality_dropout)
+                )
+
+                lip_feat = lip_feat.masked_fill(drop_lip, 0.0)
+                vocal_feat = vocal_feat.masked_fill(drop_vocal, 0.0)
+                features = [lip_feat, vocal_feat]
+
+            x = torch.cat(features, dim=-1)
+        else:
+            x = features[0]
+
+        x = self.fusion(x)
+        x = self.pos_encoder(x)
+
+        x = self.encoder(x)
+
+        if self.pooling == "attention":
+            attention_scores = self.attention_pool(x)
+            attention_weights = torch.softmax(attention_scores, dim=1)
+            x = torch.sum(attention_weights * x, dim=1)
+        else:
+            x = x.mean(dim=1)
+
+        logits = self.classifier(x)
+        return logits
+
+
+class M2VoiceTextDataset(Dataset):
+    def __init__(
+        self,
+        root_dir,
+        label_texts,
+        split_name,
+        vocal_representation="magnitude"
+    ):
+        self.root_dir = root_dir
+        self.split_name = split_name
+
+        valid_representations = {
+            "magnitude",
+            "phase",
+            "phase_diff",
+            "real_imag",
+            "magnitude_phase",
+        }
+        if vocal_representation not in valid_representations:
+            raise ValueError(
+                f"Unsupported vocal representation: {vocal_representation}"
+            )
+
+        self.vocal_representation = vocal_representation
+        self.vocal_in_channels = (
+            512
+            if vocal_representation in {"real_imag", "magnitude_phase"}
+            else 256
+        )
+
+        self.audio_dir = os.path.join(root_dir, "Audio")
+        self.lip_dir = os.path.join(root_dir, "mmLip")
+        self.vocal_dir = os.path.join(root_dir, "mmVocal")
+        self.txt_dir = os.path.join(root_dir, "txt")
+
+        self.samples = []
+        # train/val/test共用由gt.txt确定的同一套20类映射。
+        self.label_texts = list(label_texts)
+        self.text_to_label = {
+            text: idx for idx, text in enumerate(self.label_texts)
+        }
+
+        self._parse_dataset()
+        self.inspect_vocal_format()
+
+        print(
+            f"Loaded {self.split_name} samples: {len(self.samples)} "
+            f"from {self.root_dir}"
+        )
+        print(
+            f"Vocal representation: {self.vocal_representation}, "
+            f"channels={self.vocal_in_channels}"
+        )
+        self.print_class_distribution()
+
+    def inspect_vocal_format(self):
+        first_path = self.samples[0]["vocal_path"]
+        raw_vocal = np.load(first_path)
+        is_complex = np.iscomplexobj(raw_vocal)
+
+        print(
+            f"Raw Vocal example: shape={raw_vocal.shape}, "
+            f"dtype={raw_vocal.dtype}, complex={is_complex}, "
+            f"file={first_path}"
+        )
+
+        if (
+            not is_complex
+            and self.vocal_representation
+            in {"phase", "phase_diff", "real_imag", "magnitude_phase"}
+        ):
+            print(
+                "[Warning] Vocal源数据不是复数；phase/imag分量将为0。"
+                "这种情况下无需运行相位相关实验。"
+            )
+
+    def _parse_dataset(self):
+        if not os.path.exists(self.audio_dir):
+            raise FileNotFoundError(self.audio_dir)
+
+        if not os.path.exists(self.lip_dir):
+            raise FileNotFoundError(self.lip_dir)
+
+        if not os.path.exists(self.vocal_dir):
+            raise FileNotFoundError(self.vocal_dir)
+
+        if not os.path.exists(self.txt_dir):
+            raise FileNotFoundError(self.txt_dir)
+
+        temp_samples = []
+
+        for audio_filename in sorted(os.listdir(self.audio_dir)):
+            if not audio_filename.endswith(".wav"):
+                continue
+
+            name = audio_filename.replace(".wav", "")
+            parts = name.split("_")
+
+            if len(parts) < 4:
+                continue
+
+            time_id = f"{parts[1]}_{parts[2]}"
+            suffix = parts[3]
+
+            lip_path = os.path.join(
+                self.lip_dir,
+                f"mmW_{time_id}_Lip_{suffix}.npy"
+            )
+
+            vocal_path = os.path.join(
+                self.vocal_dir,
+                f"mmW_{time_id}_Vib_{suffix}.npy"
+            )
+
+            txt_path = os.path.join(
+                self.txt_dir,
+                f"{name}.txt"
+            )
+
+            if not os.path.exists(lip_path):
+                print(f"[Missing Lip] {lip_path}")
+                continue
+
+            if not os.path.exists(vocal_path):
+                print(f"[Missing Vocal] {vocal_path}")
+                continue
+
+            if not os.path.exists(txt_path):
+                print(f"[Missing Txt] {txt_path}")
+                continue
+
+            with open(txt_path, "r", encoding="utf-8") as f:
+                text = clean_text(f.read())
+
+            if len(text) == 0:
+                print(f"[Empty Txt] {txt_path}")
+                continue
+
+            temp_samples.append({
+                "id": name,
+                "lip_path": lip_path,
+                "vocal_path": vocal_path,
+                "txt_path": txt_path,
+                "text": text,
+            })
+
+        for sample in temp_samples:
+            if sample["text"] not in self.text_to_label:
+                raise ValueError(
+                    f"[{self.split_name}] 检测到不属于20条GT的标签：\n"
+                    f"文件：{sample['txt_path']}\n"
+                    f"文本：{sample['text']}"
+                )
+
+            sample["label"] = self.text_to_label[sample["text"]]
+            self.samples.append(sample)
+
+        if len(self.samples) == 0:
+            raise ValueError(
+                f"{self.split_name}数据集为空：{self.root_dir}"
+            )
+
+    def print_class_distribution(self):
+        counts = Counter(sample["label"] for sample in self.samples)
+        missing = []
+
+        print(f"\n========== {self.split_name} Class Distribution ==========")
+        for label_id, text in enumerate(self.label_texts):
+            count = counts.get(label_id, 0)
+            print(f"{label_id:02d}: {count:3d} | {text}")
+            if count == 0:
+                missing.append(label_id)
+
+        if missing:
+            print(
+                f"[Warning] {self.split_name}缺少类别：{missing}。"
+                "标签ID仍与其他数据集保持一致。"
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+
+        lip = np.load(sample["lip_path"])
+        vocal = np.load(sample["vocal_path"])
+
+        if vocal.ndim != 2:
+            raise ValueError(
+                f"Unexpected vocal shape: "
+                f"{vocal.shape}, file={sample['vocal_path']}"
+            )
+
+        # 如果数据为[Time, 256]，自动转置
+        if vocal.shape[0] != 256:
+            if vocal.shape[1] == 256:
+                vocal = vocal.T
+            else:
+                raise ValueError(
+                    f"Vocal channel number is not 256: "
+                    f"{vocal.shape}, file={sample['vocal_path']}"
+                )
+
+        lip = np.asarray(lip, dtype=np.float32)
+
+        is_complex = np.iscomplexobj(vocal)
+
+        if self.vocal_representation == "magnitude":
+            vocal = np.abs(vocal)
+
+        elif self.vocal_representation == "phase":
+            if is_complex:
+                vocal = np.unwrap(np.angle(vocal), axis=1) / np.pi
+            else:
+                # 实数数据没有独立相位信息。
+                vocal = np.zeros_like(vocal, dtype=np.float32)
+
+        elif self.vocal_representation == "phase_diff":
+            if is_complex:
+                unwrapped_phase = np.unwrap(np.angle(vocal), axis=1)
+                vocal = np.diff(
+                    unwrapped_phase,
+                    axis=1,
+                    prepend=unwrapped_phase[:, :1]
+                ) / np.pi
+            else:
+                vocal = np.zeros_like(vocal, dtype=np.float32)
+
+        elif self.vocal_representation == "real_imag":
+            real = np.real(vocal)
+            imag = (
+                np.imag(vocal)
+                if is_complex
+                else np.zeros_like(real)
+            )
+            vocal = np.concatenate([real, imag], axis=0)
+
+        elif self.vocal_representation == "magnitude_phase":
+            magnitude = np.abs(vocal)
+            phase = (
+                np.unwrap(np.angle(vocal), axis=1) / np.pi
+                if is_complex
+                else np.zeros_like(magnitude)
+            )
+            vocal = np.concatenate([magnitude, phase], axis=0)
+
+        vocal = np.asarray(vocal, dtype=np.float32)
+
+        lip = torch.from_numpy(lip).float()
+        vocal = torch.from_numpy(vocal).float()
+
+        lip = (lip - lip.mean()) / (lip.std() + 1e-6)
+        vocal = (vocal - vocal.mean()) / (vocal.std() + 1e-6)
+
+        
+
+        return {
+            "id": sample["id"],
+            "lip": lip,
+            "vocal": vocal,
+            "label": sample["label"],
+            "text": sample["text"],
+        }
+
+
+def collate_fn(batch):
+    ids = [b["id"] for b in batch]
+    texts = [b["text"] for b in batch]
+
+    lips = pad_sequence(
+        [b["lip"] for b in batch],
+        batch_first=True
+    ).unsqueeze(1)
+
+    vocals = pad_sequence(
+        [b["vocal"] for b in batch],
+        batch_first=True
+    )
+
+    labels = torch.tensor(
+        [b["label"] for b in batch],
+        dtype=torch.long
+    )
+
+    return {
+        "id": ids,
+        "lip": lips,
+        "vocal": vocals,
+        "label": labels,
+        "text": texts,
+    }
+
+
+def evaluate(model, loader, device, num_classes=None):
+    model.eval()
+
+    correct = 0
+    total = 0
+    total_loss = 0.0
+
+    class_correct = None
+    class_total = None
+    if num_classes is not None:
+        class_correct = [0] * num_classes
+        class_total = [0] * num_classes
+
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for batch in loader:
+            lip = batch["lip"].to(device)
+            vocal = batch["vocal"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(lip, vocal)
+            loss = criterion(logits, labels)
+
+            pred = logits.argmax(dim=-1)
+
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+            total_loss += loss.item() * labels.size(0)
+
+            if num_classes is not None:
+                for label, prediction in zip(
+                    labels.cpu().tolist(),
+                    pred.cpu().tolist()
+                ):
+                    class_total[label] += 1
+                    if label == prediction:
+                        class_correct[label] += 1
+
+    acc = correct / max(1, total)
+    avg_loss = total_loss / max(1, total)
+
+    return avg_loss, acc, class_correct, class_total
+
+
+def evaluate_detailed(model, loader, device, label_texts):
+    """用于训练完成后的逐类准确率、混淆矩阵和错误样本诊断。"""
+    model.eval()
+
+    num_classes = len(label_texts)
+    criterion = nn.CrossEntropyLoss()
+
+    confusion = torch.zeros(
+        num_classes,
+        num_classes,
+        dtype=torch.long
+    )
+
+    total_loss = 0.0
+    total = 0
+    correct = 0
+    errors = []
+
+    with torch.no_grad():
+        for batch in loader:
+            lip = batch["lip"].to(device)
+            vocal = batch["vocal"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(lip, vocal)
+            loss = criterion(logits, labels)
+            predictions = logits.argmax(dim=-1)
+
+            batch_size = labels.size(0)
+            total_loss += loss.item() * batch_size
+            total += batch_size
+            correct += (predictions == labels).sum().item()
+
+            labels_cpu = labels.cpu().tolist()
+            predictions_cpu = predictions.cpu().tolist()
+
+            for sample_id, target, prediction in zip(
+                batch["id"],
+                labels_cpu,
+                predictions_cpu
+            ):
+                confusion[target, prediction] += 1
+
+                if target != prediction:
+                    errors.append({
+                        "sample_id": sample_id,
+                        "target_id": target,
+                        "prediction_id": prediction,
+                        "target_text": label_texts[target],
+                        "prediction_text": label_texts[prediction],
+                    })
+
+    class_total = confusion.sum(dim=1)
+    class_correct = confusion.diag()
+
+    per_class = []
+    for label_id, text in enumerate(label_texts):
+        class_count = int(class_total[label_id].item())
+        correct_count = int(class_correct[label_id].item())
+        class_acc = (
+            correct_count / class_count
+            if class_count > 0
+            else None
+        )
+
+        per_class.append({
+            "label_id": label_id,
+            "text": text,
+            "correct": correct_count,
+            "total": class_count,
+            "accuracy": class_acc,
+        })
+
+    suffix_results = []
+    for suffix_number in range(1, 11):
+        label_ids = [suffix_number - 1, suffix_number + 9]
+        suffix_correct = sum(
+            int(class_correct[label_id].item())
+            for label_id in label_ids
+        )
+        suffix_total = sum(
+            int(class_total[label_id].item())
+            for label_id in label_ids
+        )
+        suffix_acc = (
+            suffix_correct / suffix_total
+            if suffix_total > 0
+            else None
+        )
+
+        suffix_results.append({
+            "suffix": f"s{suffix_number}",
+            "label_ids": label_ids,
+            "correct": suffix_correct,
+            "total": suffix_total,
+            "accuracy": suffix_acc,
+        })
+
+    return {
+        "loss": total_loss / max(1, total),
+        "accuracy": correct / max(1, total),
+        "total": total,
+        "per_class": per_class,
+        "per_suffix": suffix_results,
+        "confusion_matrix": confusion.tolist(),
+        "errors": errors,
+    }
+
+
+def print_and_save_diagnostics(
+    split_name,
+    metrics,
+    label_texts,
+    output_dir
+):
+    print(f"\n========== {split_name} Detailed Results ==========")
+    print(f"Loss     : {metrics['loss']:.4f}")
+    print(f"Accuracy : {metrics['accuracy'] * 100:.2f}%")
+    print(f"Samples  : {metrics['total']}")
+
+    print(f"\n========== {split_name} Per-Class Accuracy ==========")
+    for row in metrics["per_class"]:
+        accuracy = row["accuracy"]
+        accuracy_text = (
+            f"{accuracy * 100:.2f}%" if accuracy is not None else "N/A"
+        )
+        print(
+            f"{row['label_id']:02d}: "
+            f"{row['correct']}/{row['total']} "
+            f"({accuracy_text}) | {row['text']}"
+        )
+
+    print(f"\n========== {split_name} Per-Suffix Accuracy ==========")
+    for row in metrics["per_suffix"]:
+        accuracy = row["accuracy"]
+        accuracy_text = (
+            f"{accuracy * 100:.2f}%" if accuracy is not None else "N/A"
+        )
+        print(
+            f"{row['suffix']:>3s}: "
+            f"{row['correct']}/{row['total']} "
+            f"({accuracy_text}) | labels={row['label_ids']}"
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    confusion_path = os.path.join(
+        output_dir,
+        f"confusion_matrix_{split_name}.csv"
+    )
+    with open(confusion_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["target\\pred"] + list(range(len(label_texts))))
+        for label_id, row in enumerate(metrics["confusion_matrix"]):
+            writer.writerow([label_id] + row)
+
+    errors_path = os.path.join(
+        output_dir,
+        f"errors_{split_name}.csv"
+    )
+    with open(errors_path, "w", encoding="utf-8-sig", newline="") as f:
+        fieldnames = [
+            "sample_id",
+            "target_id",
+            "prediction_id",
+            "target_text",
+            "prediction_text",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics["errors"])
+
+    metrics_path = os.path.join(
+        output_dir,
+        f"metrics_{split_name}.json"
+    )
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    return {
+        "confusion_matrix": confusion_path,
+        "errors": errors_path,
+        "metrics": metrics_path,
+    }
+
+
+def load_label_texts(gt_file):
+    if not os.path.isfile(gt_file):
+        raise FileNotFoundError(f"GT文件不存在：{gt_file}")
+
+    with open(gt_file, "r", encoding="utf-8") as f:
+        label_texts = [
+            clean_text(line)
+            for line in f
+            if clean_text(line)
+        ]
+
+    if len(label_texts) != 20:
+        raise ValueError(
+            f"GT文件应包含20条非空句子，当前为{len(label_texts)}条："
+            f"{gt_file}"
+        )
+
+    if len(set(label_texts)) != 20:
+        raise ValueError("GT文件清洗后存在重复句子。")
+
+    return label_texts
+
+
+def validate_split_overlap(train_dataset, val_dataset, test_dataset):
+    split_ids = {
+        "train": {sample["id"] for sample in train_dataset.samples},
+        "val": {sample["id"] for sample in val_dataset.samples},
+        "test": {sample["id"] for sample in test_dataset.samples},
+    }
+
+    pairs = [
+        ("train", "val"),
+        ("train", "test"),
+        ("val", "test"),
+    ]
+
+    for left, right in pairs:
+        overlap = split_ids[left] & split_ids[right]
+        if overlap:
+            examples = sorted(overlap)[:10]
+            raise ValueError(
+                f"{left}与{right}存在{len(overlap)}个重复样本，"
+                f"例如：{examples}"
+            )
+
+    print("\nSplit overlap check: passed")
+
+
+def train(experiment):
+    experiment_name = experiment["name"]
+    modality = experiment["modality"]
+    vocal_representation = experiment["vocal_representation"]
+
+    split_root = "/data2/fanl/M2Voice/dataset/split2_v2"
+    train_path = os.path.join(split_root, "train")
+    val_path = os.path.join(split_root, "val")
+    test_path = os.path.join(split_root, "test")
+    gt_file = "/data2/fanl/M2Voice/dataset/dt2/gt.txt"
+
+    checkpoint_dir = (
+        f"checkpoints_text_cls_split2_v2_{experiment_name}"
+    )
+    checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
+
+    seed = 42
+    num_epochs = 100
+    batch_size = 8
+    lr = 1e-4
+    target_seq_len = 128
+    early_stopping_patience = 20
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    print(f"Experiment: {experiment_name}")
+    print(f"Modality: {modality}")
+    print(f"Vocal representation: {vocal_representation}")
+
+    # 标签顺序完全由gt.txt决定，三套数据共用同一个text_to_label。
+    label_texts = load_label_texts(gt_file)
+
+    print("\n========== Shared Label Mapping ==========")
+    for label_id, text in enumerate(label_texts):
+        print(f"{label_id:02d}: {text}")
+
+    train_dataset = M2VoiceTextDataset(
+        train_path,
+        label_texts,
+        split_name="train",
+        vocal_representation=vocal_representation
+    )
+    val_dataset = M2VoiceTextDataset(
+        val_path,
+        label_texts,
+        split_name="val",
+        vocal_representation=vocal_representation
+    )
+    test_dataset = M2VoiceTextDataset(
+        test_path,
+        label_texts,
+        split_name="test",
+        vocal_representation=vocal_representation
+    )
+
+    if not (
+        train_dataset.vocal_in_channels
+        == val_dataset.vocal_in_channels
+        == test_dataset.vocal_in_channels
+    ):
+        raise ValueError("train/val/test的Vocal通道数不一致。")
+
+    validate_split_overlap(
+        train_dataset,
+        val_dataset,
+        test_dataset
+    )
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    with open(
+        os.path.join(checkpoint_dir, "label_texts.json"),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(label_texts, f, ensure_ascii=False, indent=2)
+
+    train_generator = torch.Generator().manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        collate_fn=collate_fn,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available(),
+        generator=train_generator
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=collate_fn,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=collate_fn,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    config = get_config(experiment)
+
+    print(
+        "Architecture: "
+        f"norm={config.norm_type}, "
+        f"pooling={config.pooling}, "
+        f"modality_dropout={config.modality_dropout}, "
+        f"layers={config.num_layers}, "
+        f"mlp_dim={config.mlp_dim}, "
+        f"dropout={config.dropout}, "
+        f"weight_decay={config.weight_decay}"
+    )
+
+    model = LipVocalTextClassifier(
+        config=config,
+        num_classes=len(label_texts),
+        target_seq_len=target_seq_len,
+        modality=modality,
+        vocal_in_channels=train_dataset.vocal_in_channels
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=config.weight_decay
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs
+    )
+
+    best_val_acc = -1.0
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+
+    print("\n========== Start Training ==========")
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        for batch_idx, batch in enumerate(train_loader):
+            lip = batch["lip"].to(device)
+            vocal = batch["vocal"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(lip, vocal)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+
+            total_loss += loss.item() * labels.size(0)
+
+            pred = logits.argmax(dim=-1)
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+
+            if batch_idx % 10 == 0:
+                gt_id = labels[0].item()
+                pred_id = pred[0].item()
+
+                print(
+                    f"\nEpoch [{epoch + 1}/{num_epochs}] "
+                    f"Batch [{batch_idx + 1}/{len(train_loader)}] "
+                    f"Loss: {loss.item():.4f}"
+                )
+
+                print(f"ID      : {batch['id'][0]}")
+                print(f"Target  : {label_texts[gt_id]}")
+                print(f"Predict : {label_texts[pred_id]}")
+                print(f"Train Acc Running: {correct / max(1, total) * 100:.2f}%")
+
+        scheduler.step()
+
+        train_acc = correct / max(1, total)
+        train_loss = total_loss / max(1, total)
+
+        val_loss, val_acc, _, _ = evaluate(
+            model,
+            val_loader,
+            device
+        )
+
+        print("\n========== Epoch Summary ==========")
+        print(f"Epoch      : {epoch + 1}")
+        print(f"Train Loss : {train_loss:.4f}")
+        print(f"Train Acc  : {train_acc * 100:.2f}%")
+        print(f"Val Loss   : {val_loss:.4f}")
+        print(f"Val Acc    : {val_acc * 100:.2f}%")
+
+        improved = (
+            val_acc > best_val_acc
+            or (
+                abs(val_acc - best_val_acc) < 1e-12
+                and val_loss < best_val_loss
+            )
+        )
+
+        if improved:
+            best_val_acc = val_acc
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "label_texts": label_texts,
+                    "best_val_acc": best_val_acc,
+                    "best_val_loss": best_val_loss,
+                    "config": {
+                        "hidden_size": config.hidden_size,
+                        "mlp_dim": config.mlp_dim,
+                        "num_heads": config.num_heads,
+                        "num_layers": config.num_layers,
+                        "dropout": config.dropout,
+                        "target_seq_len": target_seq_len,
+                        "weight_decay": config.weight_decay,
+                        "norm_type": config.norm_type,
+                        "pooling": config.pooling,
+                        "modality_dropout": config.modality_dropout,
+                    },
+                    "split_root": split_root,
+                    "experiment_name": experiment_name,
+                    "modality": modality,
+                    "vocal_representation": vocal_representation,
+                    "vocal_in_channels": train_dataset.vocal_in_channels,
+                },
+                checkpoint_path
+            )
+
+            print(
+                f"Saved best model. Val Acc = {best_val_acc * 100:.2f}%, "
+                f"Val Loss = {best_val_loss:.4f}"
+            )
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"No improvement: "
+                f"{epochs_without_improvement}/"
+                f"{early_stopping_patience}"
+            )
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch + 1}. "
+                f"Best Val Acc = {best_val_acc * 100:.2f}%"
+            )
+            break
+
+    print("\n========== Load Best Model ==========")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if checkpoint["label_texts"] != label_texts:
+        raise ValueError("Checkpoint标签映射与当前GT标签映射不一致。")
+
+    if checkpoint.get("modality", "fusion") != modality:
+        raise ValueError("Checkpoint模态与当前实验模态不一致。")
+
+    if (
+        checkpoint.get("vocal_representation", "magnitude")
+        != vocal_representation
+    ):
+        raise ValueError("Checkpoint的Vocal表示与当前实验不一致。")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    print(f"Best epoch    : {checkpoint['epoch']}")
+    print(f"Best Val Loss : {checkpoint['best_val_loss']:.4f}")
+    print(f"Best Val Acc  : {checkpoint['best_val_acc'] * 100:.2f}%")
+
+    # 对最佳模型执行步骤1和步骤2：
+    # train/val/test逐类评估，并保存混淆矩阵和错误样本。
+    split_loaders = {
+        "train": train_loader,
+        "val": val_loader,
+        "test": test_loader,
+    }
+
+    detailed_results = {}
+    diagnostic_files = {}
+
+    for split_name, loader in split_loaders.items():
+        metrics = evaluate_detailed(
+            model,
+            loader,
+            device,
+            label_texts
+        )
+        detailed_results[split_name] = metrics
+        diagnostic_files[split_name] = print_and_save_diagnostics(
+            split_name,
+            metrics,
+            label_texts,
+            checkpoint_dir
+        )
+
+    results = {
+        "experiment_name": experiment_name,
+        "modality": modality,
+        "vocal_representation": vocal_representation,
+        "norm_type": config.norm_type,
+        "pooling": config.pooling,
+        "modality_dropout": config.modality_dropout,
+        "num_layers": config.num_layers,
+        "mlp_dim": config.mlp_dim,
+        "dropout": config.dropout,
+        "weight_decay": config.weight_decay,
+        "best_epoch": checkpoint["epoch"],
+        "best_val_loss": checkpoint["best_val_loss"],
+        "best_val_accuracy": checkpoint["best_val_acc"],
+        "train_accuracy": detailed_results["train"]["accuracy"],
+        "val_accuracy": detailed_results["val"]["accuracy"],
+        "test_accuracy": detailed_results["test"]["accuracy"],
+        "diagnostic_files": diagnostic_files,
+    }
+
+    results_path = os.path.join(
+        checkpoint_dir,
+        "experiment_summary.json"
+    )
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"\nCheckpoint   : {checkpoint_path}")
+    print(f"Summary      : {results_path}")
+
+    return results
+
+
+if __name__ == "__main__":
+    # 第二轮：固定Vocal=magnitude，只迭代Fusion的跨会话泛化结构。
+    experiments = [
+        {
+            "name": "fusion_baseline",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+        },
+        {
+            "name": "fusion_groupnorm",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+            "norm_type": "group",
+        },
+        {
+            "name": "fusion_attention_pool",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+            "pooling": "attention",
+        },
+        {
+            "name": "fusion_modality_dropout",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+            "modality_dropout": 0.30,
+        },
+        {
+            "name": "fusion_regularized",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+            "num_layers": 2,
+            "mlp_dim": 128,
+            "dropout": 0.40,
+            "weight_decay": 1e-2,
+        },
+        {
+            "name": "fusion_combined",
+            "modality": "fusion",
+            "vocal_representation": "magnitude",
+            "norm_type": "group",
+            "pooling": "attention",
+            "modality_dropout": 0.30,
+            "num_layers": 2,
+            "mlp_dim": 128,
+            "dropout": 0.40,
+            "weight_decay": 1e-2,
+        },
+    ]
+
+    ablation_results = []
+    for experiment in experiments:
+        print("\n" + "#" * 90)
+        print(f"Start experiment: {experiment['name']}")
+        print("#" * 90)
+        ablation_results.append(train(experiment))
+
+    ablation_summary_path = "fusion_iteration_summary.csv"
+    with open(
+        ablation_summary_path,
+        "w",
+        encoding="utf-8-sig",
+        newline=""
+    ) as f:
+        fieldnames = [
+            "experiment_name",
+            "modality",
+            "vocal_representation",
+            "norm_type",
+            "pooling",
+            "modality_dropout",
+            "num_layers",
+            "mlp_dim",
+            "dropout",
+            "weight_decay",
+            "best_epoch",
+            "best_val_loss",
+            "best_val_accuracy",
+            "train_accuracy",
+            "val_accuracy",
+            "test_accuracy",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([
+            {key: result[key] for key in fieldnames}
+            for result in ablation_results
+        ])
+
+    print("\n========== Ablation Summary ==========")
+    for result in ablation_results:
+        print(
+            f"{result['experiment_name']:24s} | "
+            f"Train={result['train_accuracy'] * 100:.2f}% | "
+            f"Val={result['val_accuracy'] * 100:.2f}% | "
+            f"Test={result['test_accuracy'] * 100:.2f}%"
+        )
+
+    print(f"Ablation CSV: {ablation_summary_path}")
