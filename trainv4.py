@@ -1,8 +1,11 @@
 import argparse
+import csv
 import os
 import re
 import math
 import json
+import random
+from pathlib import Path
 import torch
 import numpy as np
 import torch.nn as nn
@@ -14,15 +17,18 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tensorboardX import SummaryWriter
 
+from remove_abnormal_samples import SAMPLE_IDS as EXCLUDED_SAMPLE_IDS
+
 
 VOCAL_CHANNELS = 256
+AUDIO_NAME_PATTERN = re.compile(r"^audio_(\d{8}_\d{6})_(s(?:10|[1-9]))$", re.IGNORECASE)
 
 
 def clean_text(text):
     text = text.lower().strip()
     text = re.sub(r"[^a-z' ]", " ", text)
     text = re.sub(r"\s+", " ", text)
-    return text
+    return text.strip()
 
 
 def get_config():
@@ -172,6 +178,8 @@ class M2VoiceTextDataset(Dataset):
         self.samples = []
         # train/val/test共用由gt.txt确定的同一套20类映射。
         self.label_texts = list(label_texts)
+        if len(self.label_texts) != 20 or len(set(self.label_texts)) != 20:
+            raise ValueError("训练标签映射必须包含 20 个互不重复的 GT。")
         self.text_to_label = {
             text: idx for idx, text in enumerate(self.label_texts)
         }
@@ -185,32 +193,35 @@ class M2VoiceTextDataset(Dataset):
         self.print_class_distribution()
 
     def _parse_dataset(self):
-        if not os.path.exists(self.audio_dir):
+        if not os.path.isdir(self.audio_dir):
             raise FileNotFoundError(self.audio_dir)
 
-        if not os.path.exists(self.lip_dir):
+        if not os.path.isdir(self.lip_dir):
             raise FileNotFoundError(self.lip_dir)
 
-        if not os.path.exists(self.vocal_dir):
+        if not os.path.isdir(self.vocal_dir):
             raise FileNotFoundError(self.vocal_dir)
 
-        if not os.path.exists(self.txt_dir):
+        if not os.path.isdir(self.txt_dir):
             raise FileNotFoundError(self.txt_dir)
 
         temp_samples = []
+        errors = []
 
         for audio_filename in sorted(os.listdir(self.audio_dir)):
-            if not audio_filename.endswith(".wav"):
+            if not audio_filename.lower().endswith(".wav"):
                 continue
 
-            name = audio_filename.replace(".wav", "")
-            parts = name.split("_")
-
-            if len(parts) < 4:
+            name = os.path.splitext(audio_filename)[0]
+            match = AUDIO_NAME_PATTERN.fullmatch(name)
+            if match is None:
+                errors.append(f"无效的音频文件名：{audio_filename}")
+                continue
+            if name.lower() in EXCLUDED_SAMPLE_IDS:
+                errors.append(f"划分中仍包含已排除样本：{name}")
                 continue
 
-            time_id = f"{parts[1]}_{parts[2]}"
-            suffix = parts[3]
+            time_id, suffix = match.group(1), match.group(2).lower()
 
             lip_path = os.path.join(
                 self.lip_dir,
@@ -227,32 +238,34 @@ class M2VoiceTextDataset(Dataset):
                 f"{name}.txt"
             )
 
-            if not os.path.exists(lip_path):
-                print(f"[Missing Lip] {lip_path}")
+            required = [os.path.join(self.audio_dir, audio_filename), lip_path, vocal_path, txt_path]
+            missing = [path for path in required if not os.path.isfile(path)]
+            if missing:
+                errors.append(f"{name} 缺少文件：{missing}")
                 continue
 
-            if not os.path.exists(vocal_path):
-                print(f"[Missing Vocal] {vocal_path}")
-                continue
-
-            if not os.path.exists(txt_path):
-                print(f"[Missing Txt] {txt_path}")
-                continue
-
-            with open(txt_path, "r", encoding="utf-8") as f:
+            with open(txt_path, "r", encoding="utf-8-sig") as f:
                 text = clean_text(f.read())
 
             if len(text) == 0:
-                print(f"[Empty Txt] {txt_path}")
+                errors.append(f"标签为空：{txt_path}")
                 continue
 
             temp_samples.append({
                 "id": name,
+                "group_id": time_id,
+                "suffix": suffix,
                 "lip_path": lip_path,
                 "vocal_path": vocal_path,
                 "txt_path": txt_path,
                 "text": text,
             })
+
+        if errors:
+            raise ValueError(f"[{self.split_name}] 数据完整性检查失败：\n" + "\n".join(errors))
+        ids = [sample["id"] for sample in temp_samples]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"[{self.split_name}] 存在同名音频样本。")
 
         for sample in temp_samples:
             if sample["text"] not in self.text_to_label:
@@ -263,6 +276,8 @@ class M2VoiceTextDataset(Dataset):
                 )
 
             sample["label"] = self.text_to_label[sample["text"]]
+            if sample["label"] % 10 + 1 != int(sample["suffix"][1:]):
+                raise ValueError(f"[{self.split_name}] 标签与文件后缀不匹配：{sample['id']}")
             self.samples.append(sample)
 
         if len(self.samples) == 0:
@@ -282,10 +297,7 @@ class M2VoiceTextDataset(Dataset):
                 missing.append(label_id)
 
         if missing:
-            print(
-                f"[Warning] {self.split_name}缺少类别：{missing}。"
-                "标签ID仍与其他数据集保持一致。"
-            )
+            raise ValueError(f"{self.split_name}缺少类别：{missing}，请检查划分结果。")
 
     def __len__(self):
         return len(self.samples)
@@ -293,8 +305,11 @@ class M2VoiceTextDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
 
-        lip = np.load(sample["lip_path"])
-        vocal = np.load(sample["vocal_path"])
+        lip = np.load(sample["lip_path"], allow_pickle=False)
+        vocal = np.load(sample["vocal_path"], allow_pickle=False)
+
+        if np.iscomplexobj(lip):
+            raise ValueError(f"Lip 特征不应为复数：{sample['lip_path']}")
 
         lip = np.asarray(lip, dtype=np.float32).squeeze()
 
@@ -326,11 +341,19 @@ class M2VoiceTextDataset(Dataset):
                 f"实际形状为{vocal.shape}：{sample['vocal_path']}"
             )
 
+        if lip.size < 2 or vocal.shape[0] < 2:
+            raise ValueError(f"特征时间序列至少需要 2 帧：{sample['id']}")
+        if not np.isfinite(lip).all() or not np.isfinite(vocal).all():
+            raise ValueError(f"特征含 NaN 或 Inf：{sample['id']}")
+
         lip = torch.from_numpy(lip).float()
         vocal = torch.from_numpy(vocal).float()
 
         lip = (lip - lip.mean()) / (lip.std() + 1e-6)
         vocal = (vocal - vocal.mean()) / (vocal.std() + 1e-6)
+
+        if not torch.isfinite(lip).all() or not torch.isfinite(vocal).all():
+            raise ValueError(f"特征标准化后含 NaN 或 Inf：{sample['id']}")
 
         return {
             "id": sample["id"],
@@ -392,6 +415,8 @@ def evaluate(model, loader, device, num_classes=None):
 
             logits = model(lip, vocal)
             loss = criterion(logits, labels)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"评估损失非有限值，样本：{batch['id']}")
 
             pred = logits.argmax(dim=-1)
 
@@ -408,8 +433,10 @@ def evaluate(model, loader, device, num_classes=None):
                     if label == prediction:
                         class_correct[label] += 1
 
-    acc = correct / max(1, total)
-    avg_loss = total_loss / max(1, total)
+    if total == 0:
+        raise ValueError("评估数据集为空。")
+    acc = correct / total
+    avg_loss = total_loss / total
 
     return avg_loss, acc, class_correct, class_total
 
@@ -418,7 +445,7 @@ def load_label_texts(gt_file):
     if not os.path.isfile(gt_file):
         raise FileNotFoundError(f"GT文件不存在：{gt_file}")
 
-    with open(gt_file, "r", encoding="utf-8") as f:
+    with open(gt_file, "r", encoding="utf-8-sig") as f:
         label_texts = [
             clean_text(line)
             for line in f
@@ -438,6 +465,7 @@ def load_label_texts(gt_file):
 
 
 def validate_split_overlap(train_dataset, val_dataset, test_dataset):
+    datasets = {"train": train_dataset, "val": val_dataset, "test": test_dataset}
     split_ids = {
         "train": {sample["id"] for sample in train_dataset.samples},
         "val": {sample["id"] for sample in val_dataset.samples},
@@ -458,8 +486,53 @@ def validate_split_overlap(train_dataset, val_dataset, test_dataset):
                 f"{left}与{right}存在{len(overlap)}个重复样本，"
                 f"例如：{examples}"
             )
+        group_overlap = (
+            {sample["group_id"] for sample in datasets[left].samples}
+            & {sample["group_id"] for sample in datasets[right].samples}
+        )
+        if group_overlap:
+            raise ValueError(f"{left}与{right}存在重复采集会话：{sorted(group_overlap)}")
 
     print("\nSplit overlap check: passed")
+
+
+def validate_split_manifest(split_root, datasets):
+    manifest_path = Path(split_root) / "split_manifest.csv"
+    actual = {
+        (dataset.split_name, sample["id"]): sample
+        for dataset in datasets for sample in dataset.samples
+    }
+    seen = set()
+    with manifest_path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"split", "sample_id", "group_id", "suffix", "label_id", "gt_number", "command_set", "label_text"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"划分清单缺少必要字段：{manifest_path}")
+        for row in reader:
+            key = (row["split"], row["sample_id"])
+            if key in seen or key not in actual:
+                raise ValueError(f"清单重复或与实际样本不一致：{key}")
+            seen.add(key)
+            sample = actual[key]
+            if (
+                row["group_id"] != sample["group_id"]
+                or row["suffix"] != sample["suffix"]
+                or int(row["label_id"]) != sample["label"]
+                or int(row["gt_number"]) != sample["label"] + 1
+                or int(row["command_set"]) != sample["label"] // 10 + 1
+                or clean_text(row["label_text"]) != sample["text"]
+            ):
+                raise ValueError(f"清单标签映射与数据或 GT 不一致：{key}")
+    if seen != set(actual):
+        raise ValueError(f"存在未记录在划分清单中的样本：{sorted(set(actual) - seen)[:10]}")
+    print(f"Split manifest check: passed ({len(seen)} samples)")
+
+
+def check_features(datasets):
+    for dataset in datasets:
+        for index in range(len(dataset)):
+            dataset[index]
+        print(f"Feature check: {dataset.split_name}, {len(dataset)} samples passed")
 
 
 def parse_args():
@@ -468,17 +541,17 @@ def parse_args():
     )
     parser.add_argument(
         "--split-root",
-        default="/data2/fanl/M2Voice/dataset/dt3_splitv2",
+        default="/data2/fanl/M2Voice/dataset/dt4_splitv2_clean",
         help="包含train/val/test三个子目录的数据集根目录。"
     )
     parser.add_argument(
         "--gt-file",
-        default="/data2/fanl/M2Voice/dataset/dt3/gt.txt",
+        default="/data2/fanl/M2Voice/dataset/dt4/gt.txt",
         help="包含20条类别文本的GT文件。"
     )
     parser.add_argument(
         "--output-dir",
-        default="runs/trainv4",
+        default="runs/trainv4_dt4_clean",
         help="checkpoint、结果和TensorBoard日志的输出目录。"
     )
     parser.add_argument("--epochs", type=int, default=100)
@@ -489,6 +562,8 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--check-data-only", action="store_true", help="校验全部划分、标签及特征，不启动训练或创建输出文件。")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--log-interval",
         type=int,
@@ -512,6 +587,13 @@ def log_class_accuracy(writer, prefix, class_correct, class_total, step):
 
 
 def train(args):
+    for name in ("epochs", "batch_size", "target_seq_len", "patience", "log_interval"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} 必须大于 0。")
+    if args.num_workers < 0 or not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("num_workers 必须非负，lr 必须是正的有限数值。")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        raise ValueError("weight_decay 必须是非负的有限数值。")
     split_root = args.split_root
     train_path = os.path.join(split_root, "train")
     val_path = os.path.join(split_root, "val")
@@ -529,12 +611,19 @@ def train(args):
     target_seq_len = args.target_seq_len
     early_stopping_patience = args.patience
 
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    requested_device = getattr(args, "device", "auto")
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("指定了 CUDA，但当前 PyTorch 无法使用 CUDA。")
+    device = torch.device(
+        ("cuda" if torch.cuda.is_available() else "cpu")
+        if requested_device == "auto" else requested_device
+    )
     print(f"Device: {device}")
 
     # 标签顺序完全由gt.txt决定，三套数据共用同一个text_to_label。
@@ -566,8 +655,32 @@ def train(args):
         test_dataset
     )
 
+    datasets = (train_dataset, val_dataset, test_dataset)
+    validate_split_manifest(split_root, datasets)
+    check_features(datasets)
+    if args.check_data_only:
+        print("\n数据检查通过，未启动训练。")
+        return
+
+    output_dir = Path(args.output_dir)
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        raise FileExistsError(f"训练输出目录非空或不是目录，请指定新的 --output-dir：{output_dir}")
+
+    run_metadata = {
+        "args": vars(args),
+        "label_texts": label_texts,
+        "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
+        "splits": {
+            dataset.split_name: {
+                "samples": len(dataset),
+                "groups": len({sample["group_id"] for sample in dataset.samples}),
+            } for dataset in datasets
+        },
+    }
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(tensorboard_dir, exist_ok=True)
+    with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
+        json.dump(run_metadata, handle, ensure_ascii=False, indent=2)
     with open(
         os.path.join(checkpoint_dir, "label_texts.json"),
         "w",
@@ -584,7 +697,7 @@ def train(args):
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=False,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
         generator=train_generator
     )
 
@@ -595,7 +708,7 @@ def train(args):
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=False,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=device.type == "cuda"
     )
 
     test_loader = DataLoader(
@@ -605,7 +718,7 @@ def train(args):
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=False,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=device.type == "cuda"
     )
 
     config = get_config()
@@ -673,13 +786,16 @@ def train(args):
 
             logits = model(lip, vocal)
             loss = criterion(logits, labels)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"训练损失非有限值，样本：{batch['id']}")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                1.0
+                1.0,
+                error_if_nonfinite=True,
             )
 
             optimizer.step()
@@ -789,6 +905,7 @@ def train(args):
                         "target_seq_len": target_seq_len,
                     },
                     "split_root": split_root,
+                    "run_metadata": run_metadata,
                 },
                 checkpoint_path
             )
@@ -877,6 +994,7 @@ def train(args):
         })
 
     results = {
+        "run_metadata": run_metadata,
         "best_epoch": checkpoint["epoch"],
         "best_val_loss": checkpoint["best_val_loss"],
         "best_val_accuracy": checkpoint["best_val_acc"],
