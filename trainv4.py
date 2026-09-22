@@ -939,16 +939,16 @@ def train(args):
                 gt_id = labels[0].item()
                 pred_id = pred[0].item()
 
-                print(
-                    f"\nEpoch [{epoch + 1}/{num_epochs}] "
-                    f"Batch [{batch_idx + 1}/{len(train_loader)}] "
-                    f"Loss: {loss.item():.4f}"
-                )
+                # print(
+                #     f"\nEpoch [{epoch + 1}/{num_epochs}] "
+                #     f"Batch [{batch_idx + 1}/{len(train_loader)}] "
+                #     f"Loss: {loss.item():.4f}"
+                # )
 
-                print(f"ID      : {batch['id'][0]}")
-                print(f"Target  : {label_texts[gt_id]}")
-                print(f"Predict : {label_texts[pred_id]}")
-                print(f"Train Acc Running: {correct / max(1, total) * 100:.2f}%")
+                # print(f"ID      : {batch['id'][0]}")
+                # print(f"Target  : {label_texts[gt_id]}")
+                # print(f"Predict : {label_texts[pred_id]}")
+                # print(f"Train Acc Running: {correct / max(1, total) * 100:.2f}%")
 
         train_acc = correct / max(1, total)
         train_loss = total_loss / max(1, total)
