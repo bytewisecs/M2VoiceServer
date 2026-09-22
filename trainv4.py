@@ -23,7 +23,9 @@ from mDataloader.exclusions import INVALID_GROUPS
 
 
 VOCAL_CHANNELS = 256
-MODEL_VERSION = "compact_tcn_late_fusion_phase_v2"
+VOCAL_INPUT_CHANNELS = 2 * VOCAL_CHANNELS
+MODEL_VERSION = "compact_tcn_late_fusion_sincos_v3"
+VOCAL_REPRESENTATION = "phase_sin_cos_no_standardization"
 AUDIO_NAME_PATTERN = re.compile(r"^audio_(\d{8}_\d{6})_(s(?:10|[1-9]))$", re.IGNORECASE)
 
 
@@ -158,7 +160,7 @@ class LipVocalTextClassifier(nn.Module):
         if self.modality not in {"fusion", "lip", "vocal"}:
             raise ValueError(f"未知模态：{self.modality}")
         self.lip_branch = TemporalBranch(1, config, num_classes) if self.modality != "vocal" else None
-        self.vocal_branch = TemporalBranch(VOCAL_CHANNELS, config, num_classes) if self.modality != "lip" else None
+        self.vocal_branch = TemporalBranch(VOCAL_INPUT_CHANNELS, config, num_classes) if self.modality != "lip" else None
 
     def forward(self, lip, vocal, lip_lengths=None, vocal_lengths=None, return_aux=False):
         lip_logits = self.lip_branch(lip, lip_lengths) if self.lip_branch is not None else None
@@ -370,10 +372,12 @@ class M2VoiceTextDataset(Dataset):
         vocal = torch.from_numpy(vocal).float()
 
         lip = (lip - lip.mean()) / (lip.std() + 1e-6)
-        vocal = (vocal - vocal.mean()) / (vocal.std() + 1e-6)
+        # 前 256 维为 sin(theta)，后 256 维为 cos(theta)。保留单位圆几何，
+        # 不对角度或编码值做逐样本标准化；实数输入必须是弧度相位。
+        vocal = encode_vocal_phase(vocal)
 
         if not torch.isfinite(lip).all() or not torch.isfinite(vocal).all():
-            raise ValueError(f"特征标准化后含 NaN 或 Inf：{sample['id']}")
+            raise ValueError(f"特征预处理后含 NaN 或 Inf：{sample['id']}")
 
         return {
             "id": sample["id"],
@@ -414,6 +418,23 @@ def collate_fn(batch):
     }
 
 
+def encode_vocal_phase(phase):
+    return torch.cat((phase.sin(), phase.cos()), dim=-1)
+
+
+def resize_vocal_phase(vocal, size):
+    """在 sin/cos 平面插值并投影回单位圆，避免跨 +/-pi 时经过零角度。"""
+    resized = F.interpolate(vocal.T[None], size=size, mode="linear",
+                            align_corners=False)[0].T.contiguous()
+    sine, cosine = resized.chunk(2, dim=-1)
+    norm = torch.sqrt(sine.square() + cosine.square())
+    pair_norm = torch.cat((norm, norm), dim=-1)
+    normalized = resized / pair_norm.clamp_min(1e-6)
+    # 两个反向向量的中点没有唯一相位；采用最近输入帧，避免零向量或除零。
+    nearest = F.interpolate(vocal.T[None], size=size, mode="nearest")[0].T
+    return torch.where(pair_norm > 1e-6, normalized, nearest)
+
+
 def collate_train_fn(batch, noise_std=0.02, time_scale=0.1, time_mask=0.05):
     """仅训练 loader 使用；两个模态共用时间缩放和相对遮挡区间。"""
     augmented = []
@@ -423,11 +444,14 @@ def collate_train_fn(batch, noise_std=0.02, time_scale=0.1, time_mask=0.05):
         if time_scale > 0:
             lip = F.interpolate(lip[None, None], size=max(2, round(lip.size(0) * scale)),
                                 mode="linear", align_corners=False)[0, 0]
-            vocal = F.interpolate(vocal.T[None], size=max(2, round(vocal.size(0) * scale)),
-                                  mode="linear", align_corners=False)[0].T.contiguous()
+            vocal = resize_vocal_phase(vocal, max(2, round(vocal.size(0) * scale)))
         if noise_std > 0:
             lip = lip + torch.randn_like(lip) * noise_std
-            vocal = vocal + torch.randn_like(vocal) * noise_std
+            # Vocal 噪声改为小角度旋转（noise_std 单位为弧度），保持 sin/cos 配对。
+            sine, cosine = vocal.chunk(2, dim=-1)
+            delta = torch.randn_like(sine) * noise_std
+            vocal = torch.cat((sine * delta.cos() + cosine * delta.sin(),
+                               cosine * delta.cos() - sine * delta.sin()), dim=-1)
         if time_mask > 0:
             fraction = torch.rand(()).item() * time_mask
             start = torch.rand(()).item() * (1.0 - fraction)
@@ -632,7 +656,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="runs/trainv4_dt4_tcn_phase",
+        default="runs/trainv4_dt4_tcn_sincos",
         help="checkpoint、结果和TensorBoard日志的输出目录。"
     )
     parser.add_argument("--epochs", type=int, default=100)
@@ -648,7 +672,8 @@ def parse_args():
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--auxiliary-weight", type=float, default=0.2)
     parser.add_argument("--no-augmentation", action="store_true")
-    parser.add_argument("--noise-std", type=float, default=0.02)
+    parser.add_argument("--noise-std", type=float, default=0.02,
+                        help="Lip 加性噪声标准差；Vocal 相位旋转噪声标准差（弧度）。")
     parser.add_argument("--time-scale", type=float, default=0.1)
     parser.add_argument("--time-mask", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=20)
@@ -768,7 +793,9 @@ def train(args):
 
     run_metadata = {
         "model_version": MODEL_VERSION,
-        "vocal_representation": "complex_angle_radians_or_existing_real_phase",
+        "vocal_representation": VOCAL_REPRESENTATION,
+        "vocal_input_channels": VOCAL_INPUT_CHANNELS,
+        "vocal_augmentation": "unit_circle_interpolation_phase_noise_radians_paired_time_mask",
         "args": vars(args),
         "label_texts": label_texts,
         "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
@@ -847,7 +874,7 @@ def train(args):
         num_classes=len(label_texts),
     ).to(device)
     print(f"Model: {MODEL_VERSION}, modality={args.modality}")
-    print("Vocal input: complex -> phase radians [-pi, pi]; real -> existing phase; per-sample standardization")
+    print("Vocal input: complex -> phase; real -> radians; [sin(phase), cos(phase)], 512 channels, no standardization")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -1073,7 +1100,7 @@ def train(args):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if checkpoint.get("model_version") != MODEL_VERSION:
-        raise ValueError("Checkpoint 模型/输入版本不匹配；相位输入模型需要重新训练。")
+        raise ValueError("Checkpoint 模型/输入版本不匹配；sin/cos 相位输入模型需要重新训练。")
     if checkpoint["label_texts"] != label_texts:
         raise ValueError("Checkpoint标签映射与当前GT标签映射不一致。")
 

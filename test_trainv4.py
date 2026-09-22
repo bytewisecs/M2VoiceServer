@@ -172,12 +172,12 @@ class TrainV4Tests(unittest.TestCase):
                            16 * 64).reshape(16, 256)
         phases = torch.tensor([np.pi/4, 3*np.pi/4, -3*np.pi/4, -np.pi/4],
                               dtype=torch.float32).repeat(16 * 64).reshape(16, 256)
-        expected = (phases - phases.mean()) / (phases.std() + 1e-6)
+        expected = torch.cat((phases.sin(), phases.cos()), dim=1)
         np.save(path, original)
         first = dataset[0]["vocal"]
         np.save(path, original.T)
         second = dataset[0]["vocal"]
-        self.assertEqual(tuple(first.shape), (16, 256))
+        self.assertEqual(tuple(first.shape), (16, 512))
         torch.testing.assert_close(first, expected)
         torch.testing.assert_close(first, second)
         # 独立改变幅度，不应改变相位输入。
@@ -187,6 +187,15 @@ class TrainV4Tests(unittest.TestCase):
         # 已提取的实数相位不能再次取 angle（否则会退化成 0/pi）。
         np.save(path, phases.numpy())
         torch.testing.assert_close(dataset[0]["vocal"], expected)
+        np.save(path, phases.numpy() + 2 * np.pi)
+        torch.testing.assert_close(dataset[0]["vocal"], expected, rtol=1e-5, atol=1e-6)
+
+    def test_zero_real_phase_is_not_standardized_away(self):
+        dataset = self.dataset()
+        np.save(dataset.samples[0]["vocal_path"], np.zeros((16, 256), dtype=np.float32))
+        sine, cosine = dataset[0]["vocal"].chunk(2, dim=1)
+        torch.testing.assert_close(sine, torch.zeros_like(sine))
+        torch.testing.assert_close(cosine, torch.ones_like(cosine))
 
     def test_nonfinite_complex_vocal_is_rejected_before_phase_conversion(self):
         dataset = self.dataset()
@@ -233,7 +242,8 @@ class TrainV4Tests(unittest.TestCase):
         checkpoint = torch.load(self.output / "checkpoints/best_model.pth", map_location="cpu")
         self.assertEqual(checkpoint["model_version"], training.MODEL_VERSION)
         self.assertEqual(checkpoint["run_metadata"]["vocal_representation"],
-                         "complex_angle_radians_or_existing_real_phase")
+                         "phase_sin_cos_no_standardization")
+        self.assertEqual(checkpoint["run_metadata"]["vocal_input_channels"], 512)
         self.assertEqual(checkpoint["config"]["pool_bins"], 2)
         history = json.loads((self.output / "training_history.json").read_text(encoding="utf-8"))
         self.assertEqual(len(history), 1)
@@ -247,7 +257,7 @@ class LengthAwareModelTests(unittest.TestCase):
         config = SimpleNamespace(hidden_size=8, pool_bins=3, vocal_bottleneck=4, num_layers=1, dropout=0.0)
         self.model = training.LipVocalTextClassifier(config, 20)
         self.lip = torch.randn(1, 1, 17)
-        self.vocal = torch.randn(1, 256, 23)
+        self.vocal = torch.randn(1, 512, 23)
 
     def test_prediction_is_independent_of_other_sample_lengths(self):
         self.model.eval()
@@ -255,7 +265,7 @@ class LengthAwareModelTests(unittest.TestCase):
             alone = self.model(self.lip, self.vocal, [17], [23])
             # 让第一条样本与更长的另一条样本同批，验证补零不改变预测。
             lip_batch = torch.cat((torch.nn.functional.pad(self.lip, (0, 44)), torch.randn(1, 1, 61)))
-            vocal_batch = torch.cat((torch.nn.functional.pad(self.vocal, (0, 50)), torch.randn(1, 256, 73)))
+            vocal_batch = torch.cat((torch.nn.functional.pad(self.vocal, (0, 50)), torch.randn(1, 512, 73)))
             batched = self.model(lip_batch, vocal_batch, [17, 61], [23, 73])
         torch.testing.assert_close(alone[0], batched[0], rtol=1e-4, atol=1e-5)
 
@@ -285,8 +295,8 @@ class LengthAwareModelTests(unittest.TestCase):
 
     def test_collate_tracks_each_modality_length(self):
         batch = training.collate_fn([
-            {"id": "a", "text": "a", "label": 0, "lip": torch.ones(17), "vocal": torch.ones(23, 256)},
-            {"id": "b", "text": "b", "label": 1, "lip": torch.ones(31), "vocal": torch.ones(19, 256)},
+            {"id": "a", "text": "a", "label": 0, "lip": torch.ones(17), "vocal": torch.ones(23, 512)},
+            {"id": "b", "text": "b", "label": 1, "lip": torch.ones(31), "vocal": torch.ones(19, 512)},
         ])
         self.assertEqual(batch["lip_lengths"].tolist(), [17, 31])
         self.assertEqual(batch["vocal_lengths"].tolist(), [23, 19])
@@ -298,7 +308,7 @@ class CompactTCNTests(unittest.TestCase):
                                vocal_bottleneck=4, modality=modality)
 
     def test_single_modality_does_not_use_other_input(self):
-        lip, vocal = torch.randn(2, 1, 17), torch.randn(2, 256, 23)
+        lip, vocal = torch.randn(2, 1, 17), torch.randn(2, 512, 23)
         for modality in ("lip", "vocal"):
             model = training.LipVocalTextClassifier(self.config(modality), 20).eval()
             with torch.no_grad():
@@ -310,7 +320,7 @@ class CompactTCNTests(unittest.TestCase):
 
     def test_fusion_and_auxiliary_objective(self):
         model = training.LipVocalTextClassifier(self.config(), 20)
-        outputs = model(torch.randn(2, 1, 17), torch.randn(2, 256, 23),
+        outputs = model(torch.randn(2, 1, 17), torch.randn(2, 512, 23),
                         [17, 15], [23, 19], return_aux=True)
         torch.testing.assert_close(outputs["logits"], (outputs["lip_logits"] + outputs["vocal_logits"]) / 2)
         labels = torch.tensor([0, 1])
@@ -323,7 +333,8 @@ class CompactTCNTests(unittest.TestCase):
 
     def test_augmentation_preserves_labels_and_original_arrays(self):
         sample = {"id": "a", "text": "command", "label": 3,
-                  "lip": torch.ones(100), "vocal": torch.ones(200, 256)}
+                  "lip": torch.ones(100), "vocal": training.encode_vocal_phase(torch.ones(200, 256))}
+        original_vocal = sample["vocal"].clone()
         torch.manual_seed(7)
         batch = training.collate_train_fn([sample], noise_std=0.02, time_scale=0.1, time_mask=0.05)
         self.assertEqual(batch["id"], ["a"])
@@ -331,17 +342,48 @@ class CompactTCNTests(unittest.TestCase):
         self.assertTrue(90 <= batch["lip_lengths"][0].item() <= 110)
         self.assertTrue(180 <= batch["vocal_lengths"][0].item() <= 220)
         torch.testing.assert_close(sample["lip"], torch.ones(100))
-        torch.testing.assert_close(sample["vocal"], torch.ones(200, 256))
+        torch.testing.assert_close(sample["vocal"], original_vocal)
         self.assertTrue(torch.isfinite(batch["lip"]).all().item())
         self.assertTrue(torch.isfinite(batch["vocal"]).all().item())
+        sine, cosine = batch["vocal"][0].chunk(2, dim=0)
+        norms_squared = sine.square() + cosine.square()
+        # 遮挡必须同时清空 sin/cos；其他位置保留单位圆。
+        self.assertTrue(torch.all((norms_squared == 0) | ((norms_squared - 1).abs() < 1e-5)).item())
 
     def test_disabled_augmentation_matches_plain_collation(self):
         samples = [{"id": "a", "text": "a", "label": 0,
-                    "lip": torch.randn(17), "vocal": torch.randn(23, 256)}]
+                    "lip": torch.randn(17), "vocal": training.encode_vocal_phase(torch.randn(23, 256))}]
         actual = training.collate_train_fn(samples, noise_std=0, time_scale=0, time_mask=0)
         expected = training.collate_fn(samples)
         for key in ("lip", "vocal", "lip_lengths", "vocal_lengths", "label"):
             torch.testing.assert_close(actual[key], expected[key])
+
+    def test_phase_resize_crosses_pi_without_passing_through_zero(self):
+        phase = torch.deg2rad(torch.tensor([[179.0], [-179.0]])).repeat(1, 256)
+        resized = training.resize_vocal_phase(training.encode_vocal_phase(phase), 3)
+        sine, cosine = resized.chunk(2, dim=1)
+        torch.testing.assert_close(sine[1], torch.zeros(256), atol=1e-6, rtol=0)
+        torch.testing.assert_close(cosine[1], -torch.ones(256), atol=1e-6, rtol=0)
+        torch.testing.assert_close(sine.square() + cosine.square(), torch.ones(3, 256))
+
+    def test_phase_resize_handles_antipodal_frames(self):
+        # 精确反向的单位向量在中点抵消，应确定性回退到最近帧。
+        vocal = torch.cat((torch.zeros(2, 256), torch.tensor([[1.0], [-1.0]]).repeat(1, 256)), dim=1)
+        resized = training.resize_vocal_phase(vocal, 3)
+        self.assertTrue(torch.isfinite(resized).all().item())
+        torch.testing.assert_close(resized[1], vocal[0])
+        sine, cosine = resized.chunk(2, dim=1)
+        torch.testing.assert_close(sine.square() + cosine.square(), torch.ones(3, 256))
+
+    def test_training_resize_uses_circular_representation(self):
+        phase = torch.deg2rad(torch.tensor([[179.0], [-179.0]])).repeat(1, 256)
+        sample = {"id": "a", "text": "a", "label": 0,
+                  "lip": torch.ones(2), "vocal": training.encode_vocal_phase(phase)}
+        # 强制 2 -> 3 帧，检查训练增强确实使用了圆周插值路径。
+        with patch.object(torch, "rand", return_value=torch.tensor(1.0)):
+            batch = training.collate_train_fn([sample], noise_std=0, time_scale=0.5, time_mask=0)
+        self.assertEqual(batch["vocal_lengths"].tolist(), [3])
+        torch.testing.assert_close(batch["vocal"][0, 256:, 1], -torch.ones(256), atol=1e-6, rtol=0)
 
 
 if __name__ == "__main__":
