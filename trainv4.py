@@ -6,6 +6,7 @@ import math
 import json
 import random
 from pathlib import Path
+from functools import partial
 import torch
 import numpy as np
 import torch.nn as nn
@@ -22,7 +23,7 @@ from mDataloader.exclusions import INVALID_GROUPS
 
 
 VOCAL_CHANNELS = 256
-MODEL_VERSION = "length_aware_layernorm_v1"
+MODEL_VERSION = "compact_tcn_late_fusion_v1"
 AUDIO_NAME_PATTERN = re.compile(r"^audio_(\d{8}_\d{6})_(s(?:10|[1-9]))$", re.IGNORECASE)
 
 
@@ -35,33 +36,18 @@ def clean_text(text):
 
 def get_config():
     config = ml_collections.ConfigDict()
-    config.hidden_size = 64
-    config.mlp_dim = 256
-    config.num_heads = 4
-    config.num_layers = 3
-    config.dropout = 0.2
+    config.hidden_size = 32
+    config.num_layers = 2
+    config.dropout = 0.3
+    config.pool_bins = 8
+    config.vocal_bottleneck = 16
+    config.modality = "fusion"
     return config
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
-        super().__init__()
-
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).float().unsqueeze(1)
-
-        div = torch.exp(
-            torch.arange(0, d_model, 2).float()
-            * (-math.log(10000.0) / d_model)
-        )
-
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
+def mask_sequence(x, lengths):
+    positions = torch.arange(x.size(2), device=x.device)
+    return x.masked_fill(positions[None, None, :] >= lengths[:, None, None], 0.0)
 
 
 class ChannelLayerNorm(nn.Module):
@@ -100,11 +86,7 @@ class ConvFrontend1D(nn.Module):
         if lengths.shape != (x.size(0),) or torch.any(lengths < 1) or torch.any(lengths > x.size(2)):
             raise ValueError("特征真实长度必须与 batch 一致，且在输入时间维范围内。")
 
-        def mask_padding(values):
-            positions = torch.arange(values.size(2), device=values.device)
-            return values.masked_fill(positions[None, None, :] >= lengths[:, None, None], 0.0)
-
-        x = mask_padding(x)
+        x = mask_sequence(x, lengths)
         for layer in self.net:
             x = layer(x)
             if isinstance(layer, nn.Conv1d):
@@ -113,87 +95,78 @@ class ConvFrontend1D(nn.Module):
                     - layer.dilation[0] * (layer.kernel_size[0] - 1) - 1
                 ) // layer.stride[0] + 1
             # 每层清除无效位置，避免卷积偏置/归一化产生的补零区信号流回有效区。
-            x = mask_padding(x)
+            x = mask_sequence(x, lengths)
         return x, lengths
 
 
-class LipVocalTextClassifier(nn.Module):
-    def __init__(self, config, num_classes, target_seq_len=128):
+class TemporalResidualBlock(nn.Module):
+    def __init__(self, channels, dilation, dropout):
         super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=5, padding=2 * dilation,
+                      dilation=dilation, groups=channels),
+            ChannelLayerNorm(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Dropout(dropout),
+        )
 
+    def forward(self, x, lengths):
+        return mask_sequence(F.gelu(x + self.net(mask_sequence(x, lengths))), lengths)
+
+
+class TemporalBranch(nn.Module):
+    def __init__(self, in_channels, config, num_classes):
+        super().__init__()
         hidden = config.hidden_size
-        self.target_seq_len = target_seq_len
-
-        self.lip_frontend = ConvFrontend1D(
-            in_channels=1,
-            hidden_size=hidden
-        )
-
-        self.vocal_frontend = ConvFrontend1D(
-            in_channels=256,
-            hidden_size=hidden
-        )
-
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-        )
-
-        self.pos_encoder = PositionalEncoding(hidden, max_len=target_seq_len)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden,
-            nhead=config.num_heads,
-            dim_feedforward=config.mlp_dim,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.num_layers
-        )
-
+        self.pool_bins = getattr(config, "pool_bins", 8)
+        bottleneck = min(in_channels, getattr(config, "vocal_bottleneck", 16))
+        self.projection = nn.Conv1d(in_channels, bottleneck, 1) if in_channels > bottleneck else nn.Identity()
+        self.frontend = ConvFrontend1D(bottleneck, hidden)
+        self.blocks = nn.ModuleList([
+            TemporalResidualBlock(hidden, 2 ** index, config.dropout)
+            for index in range(config.num_layers)
+        ])
+        pooled_size = hidden * (self.pool_bins + 1)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, hidden),
+            nn.LayerNorm(pooled_size),
+            nn.Dropout(config.dropout),
+            nn.Linear(pooled_size, hidden),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(hidden, num_classes)
+            nn.Linear(hidden, num_classes),
         )
 
-    def _resample_valid_features(self, features, lengths):
-        # 只插值各样本的有效卷积输出；对齐后 Transformer 不再含 padding。
-        return torch.cat([
-            F.interpolate(
-                features[index:index + 1, :, :length],
-                size=self.target_seq_len, mode="linear", align_corners=False,
-            )
-            for index, length in enumerate(lengths.detach().cpu().tolist())
-        ], dim=0)
+    def forward(self, x, lengths=None):
+        x, lengths = self.frontend(self.projection(x), lengths)
+        for block in self.blocks:
+            x = block(x, lengths)
+        pooled = []
+        for index, length in enumerate(lengths.detach().cpu().tolist()):
+            valid = x[index:index + 1, :, :length]
+            # 少量时间分箱保留粗粒度顺序，标准差补充动态强度；不池化 padding。
+            bins = F.adaptive_avg_pool1d(valid, self.pool_bins)
+            variability = valid.std(dim=2, unbiased=False, keepdim=True)
+            pooled.append(torch.cat((bins, variability), dim=2).flatten(1))
+        return self.classifier(torch.cat(pooled, dim=0))
 
-    def forward(self, lip, vocal, lip_lengths=None, vocal_lengths=None):
-        lip_feat, lip_lengths = self.lip_frontend(lip, lip_lengths)
-        vocal_feat, vocal_lengths = self.vocal_frontend(vocal, vocal_lengths)
 
-        lip_feat = self._resample_valid_features(lip_feat, lip_lengths)
-        vocal_feat = self._resample_valid_features(vocal_feat, vocal_lengths)
+class LipVocalTextClassifier(nn.Module):
+    def __init__(self, config, num_classes):
+        super().__init__()
+        self.modality = getattr(config, "modality", "fusion")
+        if self.modality not in {"fusion", "lip", "vocal"}:
+            raise ValueError(f"未知模态：{self.modality}")
+        self.lip_branch = TemporalBranch(1, config, num_classes) if self.modality != "vocal" else None
+        self.vocal_branch = TemporalBranch(VOCAL_CHANNELS, config, num_classes) if self.modality != "lip" else None
 
-        lip_feat = lip_feat.transpose(1, 2)
-        vocal_feat = vocal_feat.transpose(1, 2)
-
-        x = torch.cat([lip_feat, vocal_feat], dim=-1)
-        x = self.fusion(x)
-        x = self.pos_encoder(x)
-
-        x = self.encoder(x)
-
-        x = x.mean(dim=1)
-
-        logits = self.classifier(x)
+    def forward(self, lip, vocal, lip_lengths=None, vocal_lengths=None, return_aux=False):
+        lip_logits = self.lip_branch(lip, lip_lengths) if self.lip_branch is not None else None
+        vocal_logits = self.vocal_branch(vocal, vocal_lengths) if self.vocal_branch is not None else None
+        available = [logits for logits in (lip_logits, vocal_logits) if logits is not None]
+        logits = torch.stack(available).mean(dim=0)
+        if return_aux:
+            return {"logits": logits, "lip_logits": lip_logits, "vocal_logits": vocal_logits}
         return logits
 
 
@@ -433,6 +406,39 @@ def collate_fn(batch):
     }
 
 
+def collate_train_fn(batch, noise_std=0.02, time_scale=0.1, time_mask=0.05):
+    """仅训练 loader 使用；两个模态共用时间缩放和相对遮挡区间。"""
+    augmented = []
+    for sample in batch:
+        lip, vocal = sample["lip"].clone(), sample["vocal"].clone()
+        scale = 1.0 + (2.0 * torch.rand(()).item() - 1.0) * time_scale
+        if time_scale > 0:
+            lip = F.interpolate(lip[None, None], size=max(2, round(lip.size(0) * scale)),
+                                mode="linear", align_corners=False)[0, 0]
+            vocal = F.interpolate(vocal.T[None], size=max(2, round(vocal.size(0) * scale)),
+                                  mode="linear", align_corners=False)[0].T.contiguous()
+        if noise_std > 0:
+            lip = lip + torch.randn_like(lip) * noise_std
+            vocal = vocal + torch.randn_like(vocal) * noise_std
+        if time_mask > 0:
+            fraction = torch.rand(()).item() * time_mask
+            start = torch.rand(()).item() * (1.0 - fraction)
+            for values in (lip, vocal):
+                left = int(start * values.size(0))
+                right = int((start + fraction) * values.size(0))
+                values[left:right] = 0
+        augmented.append({**sample, "lip": lip, "vocal": vocal})
+    return collate_fn(augmented)
+
+
+def classification_objective(outputs, labels, criterion, auxiliary_weight):
+    loss = criterion(outputs["logits"], labels)
+    branches = [outputs[name] for name in ("lip_logits", "vocal_logits") if outputs[name] is not None]
+    if len(branches) == 2 and auxiliary_weight > 0:
+        loss = loss + auxiliary_weight * torch.stack([criterion(logits, labels) for logits in branches]).mean()
+    return loss
+
+
 def evaluate(model, loader, device, num_classes=None):
     model.eval()
 
@@ -618,14 +624,25 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="runs/trainv4_dt4_length_aware",
+        default="runs/trainv4_dt4_tcn",
         help="checkpoint、结果和TensorBoard日志的输出目录。"
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--target-seq-len", type=int, default=128)
+    parser.add_argument("--hidden-size", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, choices=(1, 2, 3, 4), default=2)
+    parser.add_argument("--pool-bins", type=int, default=8)
+    parser.add_argument("--vocal-bottleneck", type=int, default=16)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--modality", choices=("fusion", "lip", "vocal"), default="fusion")
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--auxiliary-weight", type=float, default=0.2)
+    parser.add_argument("--no-augmentation", action="store_true")
+    parser.add_argument("--noise-std", type=float, default=0.02)
+    parser.add_argument("--time-scale", type=float, default=0.1)
+    parser.add_argument("--time-mask", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -654,13 +671,21 @@ def log_class_accuracy(writer, prefix, class_correct, class_total, step):
 
 
 def train(args):
-    for name in ("epochs", "batch_size", "target_seq_len", "patience", "log_interval"):
+    for name in ("epochs", "batch_size", "pool_bins", "vocal_bottleneck", "patience", "log_interval"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} 必须大于 0。")
     if args.num_workers < 0 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("num_workers 必须非负，lr 必须是正的有限数值。")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         raise ValueError("weight_decay 必须是非负的有限数值。")
+    if args.hidden_size < 4 or args.hidden_size % 2:
+        raise ValueError("hidden_size 必须是至少为 4 的偶数。")
+    for name in ("dropout", "label_smoothing", "time_scale", "time_mask"):
+        if not 0 <= getattr(args, name) < 1:
+            raise ValueError(f"{name} 必须在 [0, 1) 范围内。")
+    for name in ("auxiliary_weight", "noise_std"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
+            raise ValueError(f"{name} 必须是非负的有限数值。")
     split_root = args.split_root
     train_path = os.path.join(split_root, "train")
     val_path = os.path.join(split_root, "val")
@@ -675,7 +700,6 @@ def train(args):
     num_epochs = args.epochs
     batch_size = args.batch_size
     lr = args.lr
-    target_seq_len = args.target_seq_len
     early_stopping_patience = args.patience
 
     random.seed(seed)
@@ -766,7 +790,10 @@ def train(args):
         batch_size=batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=(collate_fn if args.no_augmentation else partial(
+            collate_train_fn, noise_std=args.noise_std,
+            time_scale=args.time_scale, time_mask=args.time_mask,
+        )),
         drop_last=False,
         pin_memory=device.type == "cuda",
         generator=train_generator
@@ -803,14 +830,17 @@ def train(args):
     )
 
     config = get_config()
+    for name in ("hidden_size", "num_layers", "pool_bins", "vocal_bottleneck", "dropout", "modality"):
+        setattr(config, name, getattr(args, name))
 
     model = LipVocalTextClassifier(
         config=config,
         num_classes=len(label_texts),
-        target_seq_len=target_seq_len
     ).to(device)
+    print(f"Model: {MODEL_VERSION}, modality={args.modality}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -839,7 +869,13 @@ def train(args):
             f"batch_size: {batch_size}",
             f"learning_rate: {lr}",
             f"weight_decay: {args.weight_decay}",
-            f"target_seq_len: {target_seq_len}",
+            f"model_version: {MODEL_VERSION}",
+            f"modality: {args.modality}",
+            f"hidden_size: {args.hidden_size}",
+            f"pool_bins: {args.pool_bins}",
+            f"label_smoothing: {args.label_smoothing}",
+            f"auxiliary_weight: {args.auxiliary_weight}",
+            f"augmentation: {not args.no_augmentation}",
             f"seed: {seed}",
         ])
     )
@@ -866,8 +902,9 @@ def train(args):
             vocal = batch["vocal"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(lip, vocal, batch["lip_lengths"], batch["vocal_lengths"])
-            loss = criterion(logits, labels)
+            outputs = model(lip, vocal, batch["lip_lengths"], batch["vocal_lengths"], return_aux=True)
+            logits = outputs["logits"]
+            loss = classification_objective(outputs, labels, criterion, args.auxiliary_weight)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"训练损失非有限值，样本：{batch['id']}")
 
@@ -954,7 +991,7 @@ def train(args):
 
         print("\n========== Epoch Summary ==========")
         print(f"Epoch      : {epoch + 1}")
-        print(f"Train Loss : {train_loss:.4f}")
+        print(f"Train Objective : {train_loss:.4f} (含标签平滑和辅助损失)")
         print(f"Train Acc  : {train_acc * 100:.2f}%")
         print(f"Train Eval Loss : {train_eval_loss:.4f}")
         print(f"Train Eval Acc  : {train_eval_acc * 100:.2f}%")
@@ -996,15 +1033,7 @@ def train(args):
                     "best_val_loss": best_val_loss,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "config": {
-                        "hidden_size": config.hidden_size,
-                        "mlp_dim": config.mlp_dim,
-                        "num_heads": config.num_heads,
-                        "num_layers": config.num_layers,
-                        "dropout": config.dropout,
-                        "target_seq_len": target_seq_len,
-                        "frontend_norm": "channel_layernorm",
-                    },
+                    "config": dict(config),
                     "split_root": split_root,
                     "run_metadata": run_metadata,
                 },
@@ -1034,7 +1063,7 @@ def train(args):
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if checkpoint.get("model_version") != MODEL_VERSION:
-        raise ValueError("Checkpoint 模型版本不匹配；长度处理和归一化修复后需要重新训练。")
+        raise ValueError("Checkpoint 模型版本不匹配；新 TCN 模型需要重新训练。")
     if checkpoint["label_texts"] != label_texts:
         raise ValueError("Checkpoint标签映射与当前GT标签映射不一致。")
 

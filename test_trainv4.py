@@ -1,6 +1,7 @@
 """使用临时数据验证训练数据接入；不读取服务器真实数据。"""
 import csv
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -177,8 +178,8 @@ class TrainV4Tests(unittest.TestCase):
     def test_model_forward_and_backward_with_variable_lengths(self):
         dataset = self.dataset()
         batch = training.collate_fn([dataset[0], dataset[2]])
-        config = SimpleNamespace(hidden_size=8, mlp_dim=16, num_heads=2, num_layers=1, dropout=0.0)
-        model = training.LipVocalTextClassifier(config, 20, target_seq_len=8)
+        config = SimpleNamespace(hidden_size=8, pool_bins=3, vocal_bottleneck=4, num_layers=1, dropout=0.0)
+        model = training.LipVocalTextClassifier(config, 20)
         logits = model(batch["lip"], batch["vocal"], batch["lip_lengths"], batch["vocal_lengths"])
         self.assertEqual(tuple(logits.shape), (2, 20))
         loss = torch.nn.functional.cross_entropy(logits, batch["label"])
@@ -199,12 +200,26 @@ class TrainV4Tests(unittest.TestCase):
             training.train(self.args("--epochs", "1"))
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
+    def test_compact_training_writes_versioned_checkpoint_and_history(self):
+        args = self.args("--epochs", "1", "--batch-size", "20", "--hidden-size", "8",
+                         "--num-layers", "1", "--pool-bins", "2", "--vocal-bottleneck", "4",
+                         "--dropout", "0", "--no-augmentation")
+        with redirect_stdout(io.StringIO()):
+            training.train(args)
+        checkpoint = torch.load(self.output / "checkpoints/best_model.pth", map_location="cpu")
+        self.assertEqual(checkpoint["model_version"], training.MODEL_VERSION)
+        self.assertEqual(checkpoint["config"]["pool_bins"], 2)
+        history = json.loads((self.output / "training_history.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(history), 1)
+        self.assertIn("train_eval_accuracy", history[0])
+        self.assertTrue((self.output / "checkpoints/test_results.json").is_file())
+
 
 class LengthAwareModelTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
-        config = SimpleNamespace(hidden_size=8, mlp_dim=16, num_heads=2, num_layers=1, dropout=0.0)
-        self.model = training.LipVocalTextClassifier(config, 20, target_seq_len=8)
+        config = SimpleNamespace(hidden_size=8, pool_bins=3, vocal_bottleneck=4, num_layers=1, dropout=0.0)
+        self.model = training.LipVocalTextClassifier(config, 20)
         self.lip = torch.randn(1, 1, 17)
         self.vocal = torch.randn(1, 256, 23)
 
@@ -249,6 +264,58 @@ class LengthAwareModelTests(unittest.TestCase):
         ])
         self.assertEqual(batch["lip_lengths"].tolist(), [17, 31])
         self.assertEqual(batch["vocal_lengths"].tolist(), [23, 19])
+
+
+class CompactTCNTests(unittest.TestCase):
+    def config(self, modality="fusion"):
+        return SimpleNamespace(hidden_size=8, num_layers=1, dropout=0.0, pool_bins=3,
+                               vocal_bottleneck=4, modality=modality)
+
+    def test_single_modality_does_not_use_other_input(self):
+        lip, vocal = torch.randn(2, 1, 17), torch.randn(2, 256, 23)
+        for modality in ("lip", "vocal"):
+            model = training.LipVocalTextClassifier(self.config(modality), 20).eval()
+            with torch.no_grad():
+                expected = model(lip, vocal, [17, 17], [23, 23])
+                actual = model(lip if modality == "lip" else torch.full_like(lip, float("nan")),
+                               vocal if modality == "vocal" else torch.full_like(vocal, float("nan")),
+                               [17, 17], [23, 23])
+            torch.testing.assert_close(actual, expected)
+
+    def test_fusion_and_auxiliary_objective(self):
+        model = training.LipVocalTextClassifier(self.config(), 20)
+        outputs = model(torch.randn(2, 1, 17), torch.randn(2, 256, 23),
+                        [17, 15], [23, 19], return_aux=True)
+        torch.testing.assert_close(outputs["logits"], (outputs["lip_logits"] + outputs["vocal_logits"]) / 2)
+        labels = torch.tensor([0, 1])
+        criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
+        loss = training.classification_objective(outputs, labels, criterion, 0.2)
+        loss.backward()
+        for branch in (model.lip_branch, model.vocal_branch):
+            self.assertTrue(any(p.grad is not None and torch.count_nonzero(p.grad).item() > 0 for p in branch.parameters()))
+        self.assertTrue(torch.isfinite(loss).item())
+
+    def test_augmentation_preserves_labels_and_original_arrays(self):
+        sample = {"id": "a", "text": "command", "label": 3,
+                  "lip": torch.ones(100), "vocal": torch.ones(200, 256)}
+        torch.manual_seed(7)
+        batch = training.collate_train_fn([sample], noise_std=0.02, time_scale=0.1, time_mask=0.05)
+        self.assertEqual(batch["id"], ["a"])
+        self.assertEqual(batch["label"].tolist(), [3])
+        self.assertTrue(90 <= batch["lip_lengths"][0].item() <= 110)
+        self.assertTrue(180 <= batch["vocal_lengths"][0].item() <= 220)
+        torch.testing.assert_close(sample["lip"], torch.ones(100))
+        torch.testing.assert_close(sample["vocal"], torch.ones(200, 256))
+        self.assertTrue(torch.isfinite(batch["lip"]).all().item())
+        self.assertTrue(torch.isfinite(batch["vocal"]).all().item())
+
+    def test_disabled_augmentation_matches_plain_collation(self):
+        samples = [{"id": "a", "text": "a", "label": 0,
+                    "lip": torch.randn(17), "vocal": torch.randn(23, 256)}]
+        actual = training.collate_train_fn(samples, noise_std=0, time_scale=0, time_mask=0)
+        expected = training.collate_fn(samples)
+        for key in ("lip", "vocal", "lip_lengths", "vocal_lengths", "label"):
+            torch.testing.assert_close(actual[key], expected[key])
 
 
 if __name__ == "__main__":
