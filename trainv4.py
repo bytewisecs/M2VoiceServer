@@ -22,6 +22,7 @@ from mDataloader.exclusions import INVALID_GROUPS
 
 
 VOCAL_CHANNELS = 256
+MODEL_VERSION = "length_aware_layernorm_v1"
 AUDIO_NAME_PATTERN = re.compile(r"^audio_(\d{8}_\d{6})_(s(?:10|[1-9]))$", re.IGNORECASE)
 
 
@@ -63,26 +64,57 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 
+class ChannelLayerNorm(nn.Module):
+    """每个时间帧独立归一化通道，不依赖 batch 或补零序列的统计量。"""
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
 class ConvFrontend1D(nn.Module):
     def __init__(self, in_channels, hidden_size):
         super().__init__()
 
         self.net = nn.Sequential(
             nn.Conv1d(in_channels, hidden_size // 2, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(hidden_size // 2),
+            ChannelLayerNorm(hidden_size // 2),
             nn.GELU(),
 
             nn.Conv1d(hidden_size // 2, hidden_size, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(hidden_size),
+            ChannelLayerNorm(hidden_size),
             nn.GELU(),
 
             nn.Conv1d(hidden_size, hidden_size, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(hidden_size),
+            ChannelLayerNorm(hidden_size),
             nn.GELU(),
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, lengths=None):
+        if lengths is None:
+            lengths = torch.full((x.size(0),), x.size(2), dtype=torch.long, device=x.device)
+        else:
+            lengths = torch.as_tensor(lengths, dtype=torch.long, device=x.device)
+        if lengths.shape != (x.size(0),) or torch.any(lengths < 1) or torch.any(lengths > x.size(2)):
+            raise ValueError("特征真实长度必须与 batch 一致，且在输入时间维范围内。")
+
+        def mask_padding(values):
+            positions = torch.arange(values.size(2), device=values.device)
+            return values.masked_fill(positions[None, None, :] >= lengths[:, None, None], 0.0)
+
+        x = mask_padding(x)
+        for layer in self.net:
+            x = layer(x)
+            if isinstance(layer, nn.Conv1d):
+                lengths = (
+                    lengths + 2 * layer.padding[0]
+                    - layer.dilation[0] * (layer.kernel_size[0] - 1) - 1
+                ) // layer.stride[0] + 1
+            # 每层清除无效位置，避免卷积偏置/归一化产生的补零区信号流回有效区。
+            x = mask_padding(x)
+        return x, lengths
 
 
 class LipVocalTextClassifier(nn.Module):
@@ -133,23 +165,22 @@ class LipVocalTextClassifier(nn.Module):
             nn.Linear(hidden, num_classes)
         )
 
-    def forward(self, lip, vocal):
-        lip_feat = self.lip_frontend(lip)
-        vocal_feat = self.vocal_frontend(vocal)
+    def _resample_valid_features(self, features, lengths):
+        # 只插值各样本的有效卷积输出；对齐后 Transformer 不再含 padding。
+        return torch.cat([
+            F.interpolate(
+                features[index:index + 1, :, :length],
+                size=self.target_seq_len, mode="linear", align_corners=False,
+            )
+            for index, length in enumerate(lengths.detach().cpu().tolist())
+        ], dim=0)
 
-        lip_feat = F.interpolate(
-            lip_feat,
-            size=self.target_seq_len,
-            mode="linear",
-            align_corners=False
-        )
+    def forward(self, lip, vocal, lip_lengths=None, vocal_lengths=None):
+        lip_feat, lip_lengths = self.lip_frontend(lip, lip_lengths)
+        vocal_feat, vocal_lengths = self.vocal_frontend(vocal, vocal_lengths)
 
-        vocal_feat = F.interpolate(
-            vocal_feat,
-            size=self.target_seq_len,
-            mode="linear",
-            align_corners=False
-        )
+        lip_feat = self._resample_valid_features(lip_feat, lip_lengths)
+        vocal_feat = self._resample_valid_features(vocal_feat, vocal_lengths)
 
         lip_feat = lip_feat.transpose(1, 2)
         vocal_feat = vocal_feat.transpose(1, 2)
@@ -395,6 +426,8 @@ def collate_fn(batch):
         "id": ids,
         "lip": lips,
         "vocal": vocals,
+        "lip_lengths": torch.tensor([b["lip"].size(0) for b in batch], dtype=torch.long),
+        "vocal_lengths": torch.tensor([b["vocal"].size(0) for b in batch], dtype=torch.long),
         "label": labels,
         "text": texts,
     }
@@ -421,7 +454,7 @@ def evaluate(model, loader, device, num_classes=None):
             vocal = batch["vocal"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(lip, vocal)
+            logits = model(lip, vocal, batch["lip_lengths"], batch["vocal_lengths"])
             loss = criterion(logits, labels)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"评估损失非有限值，样本：{batch['id']}")
@@ -585,7 +618,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="runs/trainv4_dt4_clean",
+        default="runs/trainv4_dt4_length_aware",
         help="checkpoint、结果和TensorBoard日志的输出目录。"
     )
     parser.add_argument("--epochs", type=int, default=100)
@@ -702,6 +735,7 @@ def train(args):
         raise FileExistsError(f"训练输出目录非空或不是目录，请指定新的 --output-dir：{output_dir}")
 
     run_metadata = {
+        "model_version": MODEL_VERSION,
         "args": vars(args),
         "label_texts": label_texts,
         "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
@@ -736,6 +770,16 @@ def train(args):
         drop_last=False,
         pin_memory=device.type == "cuda",
         generator=train_generator
+    )
+
+    # 使用独立且不打乱的 loader，评估固定权重在训练集上的表现。
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=device.type == "cuda",
     )
 
     val_loader = DataLoader(
@@ -783,6 +827,7 @@ def train(args):
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     global_step = 0
+    history = []
 
     writer = SummaryWriter(logdir=tensorboard_dir)
     writer.add_text(
@@ -821,7 +866,7 @@ def train(args):
             vocal = batch["vocal"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(lip, vocal)
+            logits = model(lip, vocal, batch["lip_lengths"], batch["vocal_lengths"])
             loss = criterion(logits, labels)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"训练损失非有限值，样本：{batch['id']}")
@@ -871,6 +916,9 @@ def train(args):
         train_acc = correct / max(1, total)
         train_loss = total_loss / max(1, total)
 
+        train_eval_loss, train_eval_acc, _, _ = evaluate(
+            model, train_eval_loader, device,
+        )
         val_loss, val_acc, val_class_correct, val_class_total = evaluate(
             model,
             val_loader,
@@ -881,12 +929,12 @@ def train(args):
         epoch_step = epoch + 1
         writer.add_scalars(
             "epoch/loss",
-            {"train": train_loss, "val": val_loss},
+            {"train": train_loss, "train_eval": train_eval_loss, "val": val_loss},
             epoch_step
         )
         writer.add_scalars(
             "epoch/accuracy",
-            {"train": train_acc, "val": val_acc},
+            {"train": train_acc, "train_eval": train_eval_acc, "val": val_acc},
             epoch_step
         )
         writer.add_scalar(
@@ -908,8 +956,22 @@ def train(args):
         print(f"Epoch      : {epoch + 1}")
         print(f"Train Loss : {train_loss:.4f}")
         print(f"Train Acc  : {train_acc * 100:.2f}%")
+        print(f"Train Eval Loss : {train_eval_loss:.4f}")
+        print(f"Train Eval Acc  : {train_eval_acc * 100:.2f}%")
         print(f"Val Loss   : {val_loss:.4f}")
         print(f"Val Acc    : {val_acc * 100:.2f}%")
+
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+            "train_eval_loss": train_eval_loss,
+            "train_eval_accuracy": train_eval_acc,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc,
+        })
+        with open(output_dir / "training_history.json", "w", encoding="utf-8") as handle:
+            json.dump(history, handle, ensure_ascii=False, indent=2)
 
         improved = (
             val_acc > best_val_acc
@@ -928,6 +990,7 @@ def train(args):
                 {
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
+                    "model_version": MODEL_VERSION,
                     "label_texts": label_texts,
                     "best_val_acc": best_val_acc,
                     "best_val_loss": best_val_loss,
@@ -940,6 +1003,7 @@ def train(args):
                         "num_layers": config.num_layers,
                         "dropout": config.dropout,
                         "target_seq_len": target_seq_len,
+                        "frontend_norm": "channel_layernorm",
                     },
                     "split_root": split_root,
                     "run_metadata": run_metadata,
@@ -969,6 +1033,8 @@ def train(args):
     print("\n========== Load Best Model ==========")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
+    if checkpoint.get("model_version") != MODEL_VERSION:
+        raise ValueError("Checkpoint 模型版本不匹配；长度处理和归一化修复后需要重新训练。")
     if checkpoint["label_texts"] != label_texts:
         raise ValueError("Checkpoint标签映射与当前GT标签映射不一致。")
 

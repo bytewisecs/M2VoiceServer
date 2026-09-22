@@ -179,7 +179,7 @@ class TrainV4Tests(unittest.TestCase):
         batch = training.collate_fn([dataset[0], dataset[2]])
         config = SimpleNamespace(hidden_size=8, mlp_dim=16, num_heads=2, num_layers=1, dropout=0.0)
         model = training.LipVocalTextClassifier(config, 20, target_seq_len=8)
-        logits = model(batch["lip"], batch["vocal"])
+        logits = model(batch["lip"], batch["vocal"], batch["lip_lengths"], batch["vocal_lengths"])
         self.assertEqual(tuple(logits.shape), (2, 20))
         loss = torch.nn.functional.cross_entropy(logits, batch["label"])
         self.assertTrue(torch.isfinite(loss).item())
@@ -198,6 +198,57 @@ class TrainV4Tests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), self.assertRaises(FileExistsError):
             training.train(self.args("--epochs", "1"))
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+
+class LengthAwareModelTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(42)
+        config = SimpleNamespace(hidden_size=8, mlp_dim=16, num_heads=2, num_layers=1, dropout=0.0)
+        self.model = training.LipVocalTextClassifier(config, 20, target_seq_len=8)
+        self.lip = torch.randn(1, 1, 17)
+        self.vocal = torch.randn(1, 256, 23)
+
+    def test_prediction_is_independent_of_other_sample_lengths(self):
+        self.model.eval()
+        with torch.no_grad():
+            alone = self.model(self.lip, self.vocal, [17], [23])
+            # 让第一条样本与更长的另一条样本同批，验证补零不改变预测。
+            lip_batch = torch.cat((torch.nn.functional.pad(self.lip, (0, 44)), torch.randn(1, 1, 61)))
+            vocal_batch = torch.cat((torch.nn.functional.pad(self.vocal, (0, 50)), torch.randn(1, 256, 73)))
+            batched = self.model(lip_batch, vocal_batch, [17, 61], [23, 73])
+        torch.testing.assert_close(alone[0], batched[0], rtol=1e-4, atol=1e-5)
+
+    def test_padding_contents_are_ignored_and_receive_no_gradient(self):
+        lip = torch.nn.functional.pad(self.lip, (0, 16), value=1000).requires_grad_()
+        vocal = torch.nn.functional.pad(self.vocal, (0, 18), value=-1000).requires_grad_()
+        padded_logits = self.model(lip, vocal, [17], [23])
+        unpadded_logits = self.model(self.lip, self.vocal, [17], [23])
+        torch.testing.assert_close(padded_logits, unpadded_logits, rtol=1e-4, atol=1e-5)
+        padded_logits.square().sum().backward()
+        self.assertEqual(torch.count_nonzero(lip.grad[:, :, 17:]).item(), 0)
+        self.assertEqual(torch.count_nonzero(vocal.grad[:, :, 23:]).item(), 0)
+        self.assertTrue(torch.isfinite(lip.grad).all().item())
+
+    def test_train_eval_agree_when_dropout_is_disabled(self):
+        with torch.no_grad():
+            self.model.train()
+            train_logits = self.model(self.lip, self.vocal, [17], [23])
+            self.model.eval()
+            eval_logits = self.model(self.lip, self.vocal, [17], [23])
+        torch.testing.assert_close(train_logits, eval_logits, rtol=1e-4, atol=1e-5)
+
+    def test_invalid_lengths_are_rejected(self):
+        for lengths in ([0], [18], [17, 17]):
+            with self.assertRaises(ValueError):
+                self.model(self.lip, self.vocal, lengths, [23])
+
+    def test_collate_tracks_each_modality_length(self):
+        batch = training.collate_fn([
+            {"id": "a", "text": "a", "label": 0, "lip": torch.ones(17), "vocal": torch.ones(23, 256)},
+            {"id": "b", "text": "b", "label": 1, "lip": torch.ones(31), "vocal": torch.ones(19, 256)},
+        ])
+        self.assertEqual(batch["lip_lengths"].tolist(), [17, 31])
+        self.assertEqual(batch["vocal_lengths"].tolist(), [23, 19])
 
 
 if __name__ == "__main__":
