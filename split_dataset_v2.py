@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 import random
@@ -6,12 +7,14 @@ import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from remove_abnormal_samples import SAMPLE_IDS as EXCLUDED_SAMPLE_IDS
+
 
 # ============================================================
 # 1. 路径与划分配置
 # ============================================================
 ROOT_DIR = Path("/data2/fanl/M2Voice/dataset/dt4")
-OUT_DIR = Path("/data2/fanl/M2Voice/dataset/dt4_splitv1")
+OUT_DIR = Path("/data2/fanl/M2Voice/dataset/dt4_splitv2_clean")
 
 AUDIO_DIR = ROOT_DIR / "Audio"
 LIP_DIR = ROOT_DIR / "mmLip"
@@ -26,7 +29,7 @@ SPLIT_RATIOS = {
     "test": 0.1,
 }
 
-# 预期每个采集会话包含s1～s10，共10个样本。
+# 仅允许已明确删除的 5 个样本缺席；其他会话仍必须完整。
 EXPECTED_SUFFIXES = {f"s{i}" for i in range(1, 11)}
 
 # audio_20260411_165321_s1.wav
@@ -91,11 +94,16 @@ def collect_samples(label_texts):
     samples = []
     errors = []
 
-    audio_files = sorted(AUDIO_DIR.glob("*.wav"))
+    audio_files = sorted(path for path in AUDIO_DIR.glob("*.wav") if path.is_file())
     if not audio_files:
         raise ValueError(f"没有找到WAV文件：{AUDIO_DIR}")
 
     for audio_file in audio_files:
+        if audio_file.stem in EXCLUDED_SAMPLE_IDS:
+            errors.append(
+                f"待排除样本仍存在：{audio_file.name}，请先执行 remove_abnormal_samples.py --apply。"
+            )
+            continue
         match = AUDIO_NAME_PATTERN.fullmatch(audio_file.stem)
 
         if not match:
@@ -162,6 +170,13 @@ def collect_samples(label_texts):
 
 
 def validate_groups(samples):
+    excluded_by_group = defaultdict(set)
+    for sample_id in EXCLUDED_SAMPLE_IDS:
+        match = AUDIO_NAME_PATTERN.fullmatch(sample_id)
+        if match is None:
+            raise ValueError(f"无效的排除样本编号：{sample_id}")
+        excluded_by_group[match.group("group_id")].add(match.group("suffix").lower())
+
     groups = defaultdict(list)
     for sample in samples:
         groups[sample["group_id"]].append(sample)
@@ -173,14 +188,16 @@ def validate_groups(samples):
         command_sets = {sample["command_set"] for sample in group_samples}
         label_ids = [sample["label_id"] for sample in group_samples]
 
-        if len(group_samples) != 10:
+        expected = EXPECTED_SUFFIXES - excluded_by_group[group_id]
+        if len(group_samples) != len(expected):
             errors.append(
-                f"会话{group_id}应包含10个样本，当前为{len(group_samples)}个。"
+                f"会话{group_id}应包含{len(expected)}个样本，当前为{len(group_samples)}个。"
             )
 
-        if suffixes != EXPECTED_SUFFIXES:
+        if suffixes != expected:
             errors.append(
-                f"会话{group_id}的后缀不完整：{sorted(suffixes)}"
+                f"会话{group_id}的后缀不符合预期："
+                f"缺失={sorted(expected - suffixes)}，多余={sorted(suffixes - expected)}"
             )
 
         if len(command_sets) != 1:
@@ -198,7 +215,7 @@ def validate_groups(samples):
 
 
 # ============================================================
-# 4. 按会话和指令组进行8:1:1划分
+# 4. 按会话和指令组进行6:3:1划分（比例按会话数计算）
 # ============================================================
 def allocate_counts(total, ratios):
     """使用最大余数法分配数量，确保三部分之和严格等于total。"""
@@ -220,6 +237,10 @@ def allocate_counts(total, ratios):
 
 
 def split_groups(groups):
+    if set(SPLIT_RATIOS) != {"train", "val", "test"} or any(
+        not 0 < ratio < 1 for ratio in SPLIT_RATIOS.values()
+    ):
+        raise ValueError("train、val、test 的划分比例必须介于 0 和 1 之间。")
     ratio_sum = sum(SPLIT_RATIOS.values())
     if abs(ratio_sum - 1.0) > 1e-8:
         raise ValueError(f"划分比例之和必须为1，当前为{ratio_sum}")
@@ -273,16 +294,41 @@ def split_groups(groups):
     return split_to_group_ids
 
 
+def validate_split_plan(groups, split_to_group_ids, label_count):
+    """复制前验证会话唯一归属、无遗漏及每个集合的类别覆盖。"""
+    assigned = [group_id for ids in split_to_group_ids.values() for group_id in ids]
+    if len(assigned) != len(set(assigned)):
+        raise ValueError("划分计划存在重复会话。")
+    if set(assigned) != set(groups):
+        raise ValueError("划分计划遗漏会话或包含未知会话。")
+
+    for split_name in SPLIT_RATIOS:
+        ids = split_to_group_ids[split_name]
+        rows = [sample for group_id in ids for sample in groups[group_id]]
+        counts = Counter(sample["label_id"] for sample in rows)
+        missing = [label + 1 for label in range(label_count) if counts[label] == 0]
+        if missing:
+            raise ValueError(f"{split_name}划分计划缺少 GT 类别：{missing}，未复制文件。")
+        print(f"Plan {split_name:5s}: groups={len(ids)}, samples={len(rows)}")
+
+
 # ============================================================
 # 5. 输出目录、复制及清单
 # ============================================================
 def prepare_output_dirs():
+    source = ROOT_DIR.resolve()
+    output = OUT_DIR.resolve()
+    if source == output or source in output.parents or output in source.parents:
+        raise ValueError("输入和输出目录不能相同，也不能互相包含。")
+    if OUT_DIR.is_symlink():
+        raise ValueError(f"输出目录不能是符号链接：{OUT_DIR}")
     if OUT_DIR.exists():
-        existing_files = [path for path in OUT_DIR.rglob("*") if path.is_file()]
-        if existing_files:
+        if not OUT_DIR.is_dir():
+            raise NotADirectoryError(OUT_DIR)
+        if any(OUT_DIR.iterdir()):
             raise FileExistsError(
-                f"输出目录中已有文件：{OUT_DIR}\n"
-                "为避免旧划分残留，请更换OUT_DIR，或确认后手动移走旧目录。"
+                f"输出目录非空：{OUT_DIR}\n"
+                "为避免旧划分残留，请通过 --out-dir 指定新的空目录。"
             )
 
     for split_name in SPLIT_RATIOS:
@@ -345,6 +391,10 @@ def verify_and_summarize(manifest_rows, label_texts, split_to_group_ids):
         "ratios": SPLIT_RATIOS,
         "root_dir": str(ROOT_DIR),
         "output_dir": str(OUT_DIR),
+        "ratio_unit": "acquisition_group",
+        "excluded_sample_ids": list(EXCLUDED_SAMPLE_IDS),
+        "sample_count": len(manifest_rows),
+        "group_count": sum(len(ids) for ids in split_to_group_ids.values()),
         "splits": {},
     }
 
@@ -424,6 +474,17 @@ def verify_and_summarize(manifest_rows, label_texts, split_to_group_ids):
 # 7. 主程序
 # ============================================================
 def main():
+    global ROOT_DIR, OUT_DIR, AUDIO_DIR, LIP_DIR, VOCAL_DIR, TXT_DIR, GT_FILE
+    parser = argparse.ArgumentParser(description="排除指定异常样本后，按采集会话分层划分数据集")
+    parser.add_argument("--root", type=Path, default=ROOT_DIR)
+    parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
+    parser.add_argument("--check-only", action="store_true", help="仅校验输入与划分计划，不复制文件")
+    args = parser.parse_args()
+    ROOT_DIR, OUT_DIR = args.root, args.out_dir
+    AUDIO_DIR, LIP_DIR = ROOT_DIR / "Audio", ROOT_DIR / "mmLip"
+    VOCAL_DIR, TXT_DIR = ROOT_DIR / "mmVocal", ROOT_DIR / "txt_calibrated"
+    GT_FILE = ROOT_DIR / "gt.txt"
+
     print(f"Source directory : {ROOT_DIR}")
     print(f"Output directory : {OUT_DIR}")
     print(f"Calibrated TXT   : {TXT_DIR}")
@@ -437,6 +498,10 @@ def main():
     print(f"Valid groups  : {len(groups)}\n")
 
     split_to_group_ids = split_groups(groups)
+    validate_split_plan(groups, split_to_group_ids, len(label_texts))
+    if args.check_only:
+        print("\n检查通过，未创建输出目录或复制文件。")
+        return
 
     prepare_output_dirs()
     manifest_rows = copy_splits(groups, split_to_group_ids)
